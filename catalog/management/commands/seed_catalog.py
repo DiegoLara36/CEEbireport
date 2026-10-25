@@ -4,7 +4,7 @@ from etl.extractors.pucp import PucpETLService
 
 
 class Command(BaseCommand):
-    help = "Ejecuta el ETL de Educación Continua PUCP hacia PostgreSQL"
+    help = "Ejecuta el ETL de Educación Continua PUCP hacia PostgreSQL."
 
     def add_arguments(self, parser):
         parser.add_argument(

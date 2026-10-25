@@ -8,6 +8,7 @@ colorama==0.4.6
 comm==0.2.3
 debugpy==1.8.22
 Django==6.1.2
+python-dotenv==1.2.1
 et_xmlfile==2.0.0
 executing==2.3.0
 idna==3.20

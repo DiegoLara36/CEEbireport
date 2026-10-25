@@ -1,0 +1,1 @@
+from ceebireport.urls import urlpatterns

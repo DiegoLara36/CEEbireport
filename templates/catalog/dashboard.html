@@ -1,0 +1,141 @@
+{% extends "catalog/base.html" %}
+
+{% block title %}Reporte de cursos · CEE BI{% endblock %}
+
+{% block content %}
+<section class="page-intro">
+    <div>
+        <p class="eyebrow">REPORTE DE OFERTA ACADÉMICA <span class="eyebrow-line"></span></p>
+        <h1>Cursos de Educación Continua</h1>
+        <p class="intro-copy">Una vista clara del catálogo PUCP para explorar su oferta por área temática.</p>
+    </div>
+    <a class="outline-link" href="{% url 'etl_flow' %}">
+        <span class="link-icon" aria-hidden="true">↗</span> Ver cómo se construye este reporte
+    </a>
+</section>
+
+<section class="metric-grid" aria-label="Indicadores del catálogo">
+    <article class="metric-card metric-primary">
+        <span class="metric-label">Cursos activos en vista</span>
+        <div class="metric-value">{{ total_courses }}<span class="metric-unit">cursos</span></div>
+        <span class="metric-note">de {{ catalog_total }} activos en PUCP</span>
+        <span class="metric-watermark" aria-hidden="true">01</span>
+    </article>
+    <article class="metric-card">
+        <span class="metric-label">Áreas temáticas</span>
+        <div class="metric-value">{{ category_total }}<span class="metric-unit">áreas</span></div>
+        <span class="metric-note">en los cursos de la vista</span>
+        <span class="metric-watermark" aria-hidden="true">02</span>
+    </article>
+    <article class="metric-card">
+        <span class="metric-label">Cursos con precio vigente</span>
+        <div class="metric-value">{{ priced_courses }}<span class="metric-unit">cursos</span></div>
+        <span class="metric-note">según la última tarifa vigente</span>
+        <span class="metric-watermark" aria-hidden="true">03</span>
+    </article>
+    <article class="metric-card">
+        <span class="metric-label">Área con más cursos</span>
+        <div class="metric-value metric-category-value">{{ highest_category_count }}<span class="metric-unit">cursos</span></div>
+        <span class="metric-note">{{ highest_category_name|default:"Sin datos" }}{% if total_courses %} · {{ highest_category_percentage }}% de la vista{% endif %}</span>
+        <span class="metric-watermark" aria-hidden="true">04</span>
+    </article>
+</section>
+
+<section class="report-grid">
+    <article class="panel distribution-panel">
+        <div class="panel-heading">
+            <div>
+                <p class="eyebrow">COMPOSICIÓN DEL CATÁLOGO</p>
+                <h2>Cursos por área</h2>
+            </div>
+            <span class="panel-caption">{{ category_total }} áreas</span>
+        </div>
+        {% if category_breakdown %}
+            <div class="bar-chart" role="list" aria-label="Cantidad de cursos por área">
+                {% for item in category_breakdown %}
+                    <div class="bar-row" role="listitem">
+                        <span class="bar-label" title="{{ item.name }}">{{ item.name }}</span>
+                        <span class="bar-track"><span class="bar-fill" style="width: {{ item.percentage }}%"></span></span>
+                        <span class="bar-count">{{ item.count }}</span>
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <p class="empty-state">No hay cursos para los filtros seleccionados.</p>
+        {% endif %}
+        <p class="chart-footnote">Distribución calculada sobre los cursos visibles.</p>
+    </article>
+
+    <article class="panel courses-panel">
+        <div class="panel-heading">
+            <div>
+                <p class="eyebrow">EXPLORADOR</p>
+                <h2>Oferta de cursos</h2>
+            </div>
+            <span class="result-count">{{ total_courses }} resultados</span>
+        </div>
+        <form class="filters" method="get" action="{% url 'dashboard' %}">
+            <label class="search-field">
+                <span class="visually-hidden">Buscar curso o área</span>
+                <span class="search-icon" aria-hidden="true">⌕</span>
+                <input type="search" name="q" value="{{ query }}" placeholder="Buscar curso o área">
+            </label>
+            <label>
+                <span class="visually-hidden">Filtrar por área</span>
+                <select name="category" aria-label="Filtrar por área">
+                    <option value="">Todas las áreas</option>
+                    {% for category in categories %}
+                        <option value="{{ category }}" {% if selected_category == category %}selected{% endif %}>{{ category }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <button class="filter-button" type="submit">Filtrar</button>
+        </form>
+
+        {% if courses %}
+            <div class="course-list">
+                {% for course in courses %}
+                    <article class="course-item">
+                        <span class="course-index">{{ forloop.counter|stringformat:"02d" }}</span>
+                        <div class="course-info">
+                            <span class="category-tag">{{ course.category }}</span>
+                            <h3>{{ course.name }}</h3>
+                            <span class="course-details">
+                                {% if course.modality %}{{ course.modality }}{% endif %}
+                                {% if course.duration_hours %}{% if course.modality %}<span>·</span>{% endif %}{{ course.duration_hours }} h{% endif %}
+                                {% if course.start_date %}<span>·</span>Desde {{ course.start_date|date:"d/m/Y" }}{% endif %}
+                                {% if course.end_date %}<span>·</span>Hasta {{ course.end_date|date:"d/m/Y" }}{% endif %}
+                                {% if course.has_certificate %}<span>·</span>Certificado{% endif %}
+                            </span>
+                        </div>
+                        <div class="course-price">
+                            {% if course.has_price %}
+                                <strong>{{ course.display_price|floatformat:2 }}</strong>
+                                <span>{{ course.currency }}</span>
+                            {% else %}
+                                <span>Precio sin dato</span>
+                            {% endif %}
+                        </div>
+                        <a class="course-link" href="{{ course.url }}" target="_blank" rel="noopener noreferrer" aria-label="Ver {{ course.name }} en PUCP">
+                            <span aria-hidden="true">↗</span>
+                        </a>
+                    </article>
+                {% endfor %}
+            </div>
+        {% else %}
+            <div class="empty-state course-empty">
+                <span class="empty-mark" aria-hidden="true">⌕</span>
+                <strong>No encontramos cursos</strong>
+                <span>Prueba con otra búsqueda o selecciona todas las áreas.</span>
+            </div>
+        {% endif %}
+        <p class="data-note"><span aria-hidden="true">i</span> La fecha y el precio corresponden a la oferta activa y a su tarifa vigente en PostgreSQL.</p>
+    </article>
+</section>
+
+<section class="source-strip">
+    <span class="source-icon" aria-hidden="true">↻</span>
+    <div><strong>Datos conectados a PostgreSQL</strong><span>Última ingesta completada: {% if last_updated %}{{ last_updated|date:"d/m/Y H:i" }}{% else %}sin ingestas registradas{% endif %}</span></div>
+    <a href="{% url 'etl_flow' %}">Conoce el flujo de datos <span aria-hidden="true">→</span></a>
+</section>
+{% endblock %}

@@ -1,0 +1,95 @@
+{% extends "catalog/base.html" %}
+
+{% block title %}Flujo ETL · CEE BI{% endblock %}
+
+{% block content %}
+<section class="page-intro flow-intro">
+    <div>
+        <p class="eyebrow">DE LA FUENTE A LA DECISIÓN <span class="eyebrow-line"></span></p>
+        <h1>Así se construye el reporte</h1>
+        <p class="intro-copy">El recorrido desde el catálogo público hasta los indicadores consultados directamente en PostgreSQL.</p>
+    </div>
+    <span class="flow-badge"><span class="status-dot"></span> Flujo actual · PUCP</span>
+</section>
+
+<section class="flow-summary">
+    <span class="summary-mark" aria-hidden="true">↗</span>
+    <div>
+        <span class="eyebrow">ETL EN UNA MIRADA</span>
+        <p>Extraemos la oferta, validamos sus datos, la guardamos en tablas relacionadas y la convertimos en información visual para explorar.</p>
+    </div>
+</section>
+
+<section class="flow-board" aria-label="Etapas del flujo ETL">
+    <div class="flow-rail" aria-hidden="true"></div>
+    <article class="flow-step">
+        <span class="step-number">01</span>
+        <div class="step-icon source-icon-large" aria-hidden="true"><span>PUCP</span></div>
+        <div class="step-content">
+            <span class="step-type">FUENTE</span>
+            <h2>Catálogo público</h2>
+            <p>La oferta de cursos se publica en el portal de Educación Continua PUCP. El extractor navega las páginas del catálogo y obtiene la información de cada curso.</p>
+            <span class="code-label">educacioncontinua.pucp.edu.pe</span>
+        </div>
+    </article>
+    <article class="flow-step">
+        <span class="step-number">02</span>
+        <div class="step-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32"><path d="M7 8h18M7 16h18M7 24h18M11 5v6m10 2v6m-7 2v6"/></svg>
+        </div>
+        <div class="step-content">
+            <span class="step-type">EXTRACT · PUCP EXTRACTOR</span>
+            <h2>Captura y paginación</h2>
+            <p><code>PucpExtractor</code> solicita el catálogo, recorre sus páginas y descarga la información detallada de cada curso para procesarla.</p>
+            <span class="code-label">etl/extractors/pucp.py</span>
+        </div>
+    </article>
+    <article class="flow-step">
+        <span class="step-number">03</span>
+        <div class="step-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32"><path d="m6 10 5 5 9-9M17 8h9v9M6 23h20"/></svg>
+        </div>
+        <div class="step-content">
+            <span class="step-type">TRANSFORM · CALIDAD</span>
+            <h2>Normalización y control</h2>
+            <p>Se interpretan fechas, precios, horarios y atributos del curso. Pydantic valida tipos y reglas de negocio; los registros inválidos se ponen en cuarentena y se reportan.</p>
+            <span class="code-label">etl/schemas.py · BeautifulSoup</span>
+        </div>
+    </article>
+    <article class="flow-step">
+        <span class="step-number">04</span>
+        <div class="step-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32"><ellipse cx="16" cy="8" rx="10" ry="4"/><path d="M6 8v8c0 2 4 4 10 4s10-2 10-4V8M6 16v8c0 2 4 4 10 4s10-2 10-4v-8"/></svg>
+        </div>
+        <div class="step-content">
+            <span class="step-type">LOAD · BASE DE DATOS</span>
+            <h2>Persistencia relacional</h2>
+            <p>En una transacción se crean o actualizan cursos, ofertas y precios. La ingesta y las páginas originales también quedan registradas para auditoría y trazabilidad.</p>
+            <span class="code-label">PostgreSQL · course · course_offering · price_snapshot</span>
+        </div>
+    </article>
+    <article class="flow-step final-step">
+        <span class="step-number">05</span>
+        <div class="step-icon presentation-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32"><path d="M5 27V5m0 22h23M10 22v-6m6 6V9m6 13v-9m6 9V6"/></svg>
+        </div>
+        <div class="step-content">
+            <span class="step-type">PRESENTACIÓN · DJANGO BI</span>
+            <h2>Indicadores para explorar</h2>
+            <p>Django consulta cursos activos, categorías, ofertas y precios vigentes en PostgreSQL. El reporte compara áreas y permite filtrar cursos con sus fechas, modalidades y precios.</p>
+            <a class="step-link" href="{% url 'dashboard' %}">Ir al reporte BI <span aria-hidden="true">→</span></a>
+        </div>
+    </article>
+</section>
+
+<section class="run-panel">
+    <div class="run-panel-copy">
+        <span class="eyebrow">ACTUALIZACIÓN MANUAL</span>
+        <h2>¿Cómo se actualiza?</h2>
+        <p>Ejecuta este comando desde la carpeta del proyecto con PostgreSQL configurado y el esquema de las tablas creado.</p>
+    </div>
+    <div class="command-box"><span class="terminal-prompt" aria-hidden="true">$</span><code>python manage.py seed_catalog</code><span class="command-caption">PostgreSQL + internet</span></div>
+</section>
+
+<p class="scope-note"><strong>Alcance de esta versión</strong> El reporte usa los cursos activos de PUCP almacenados en PostgreSQL. La última ingesta y los precios se muestran según los registros disponibles en la base de datos.</p>
+{% endblock %}
