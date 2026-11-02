@@ -1,6 +1,6 @@
 # catalog/management/commands/seed_catalog.py
 from django.core.management.base import BaseCommand
-from etl.extractors.pucp import PucpETLService
+from etl.services.etl_engine import ETLEngine
 
 
 class Command(BaseCommand):
@@ -15,5 +15,4 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        service = PucpETLService()
-        service.run(max_courses=options["limit"])
+        ETLEngine("PUCP").run(limit=options["limit"])

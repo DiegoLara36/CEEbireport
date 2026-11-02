@@ -13,6 +13,7 @@ class BaseExtractor(ABC):
 
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
+        self.raw_pages: List[Tuple[str, bytes]] = []
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -24,6 +25,7 @@ class BaseExtractor(ABC):
         response.raise_for_status()
         html_bytes = response.content
         sha256_hash = hashlib.sha256(html_bytes).hexdigest()
+        self.raw_pages.append((url, html_bytes))
         return response.text, html_bytes, sha256_hash
 
     @abstractmethod

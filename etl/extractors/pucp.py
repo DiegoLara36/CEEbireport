@@ -3,7 +3,7 @@ import re
 import json
 import time as time_module
 import hashlib
-from datetime import datetime, date, time, timezone
+from datetime import date, time
 from decimal import Decimal
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -12,6 +12,8 @@ import requests
 from bs4 import BeautifulSoup
 from pydantic import ValidationError
 from django.db import connection, transaction
+from django.utils import timezone as django_timezone
+from django.utils.text import slugify
 
 from etl.extractors.base import BaseExtractor
 from etl.schemas import (
@@ -129,7 +131,7 @@ class PucpExtractor(BaseExtractor):
           la fecha final pasa al siguiente año respecto al año de inicio.
         - Retorna objetos `date` (para PostgreSQL) y strings `DD/MM/YYYY`.
         """
-        ref = reference_date or datetime.now(timezone.utc).date()
+        ref = reference_date or django_timezone.localdate()
 
         start_match = re.search(r"(\d{1,2})\s+de\s+([a-záéíóú]+)(?:\s+de\s+(\d{4}))?", el3_start.lower())
         end_match = re.search(r"(\d{1,2})\s+de\s+([a-záéíóú]+)(?:\s+de\s+(\d{4}))?", el4_end.lower())
@@ -329,6 +331,7 @@ class PucpExtractor(BaseExtractor):
         cert_text = get_el(16).lower()
         has_cert = "certificado" in cert_text or "certificación" in cert_text
         has_part_cert = "constancia" in cert_text
+        price_details = get_el(17) or None
 
         # Elemento 18: Contacto
         contact_name = get_el(18)
@@ -336,7 +339,10 @@ class PucpExtractor(BaseExtractor):
 
         # Código único de la cohorte (`course_offering.external_code`)
         offering_code = brochure_code or (
-            f"{slug}-{start_dt.isoformat()}" if start_dt else f"{slug}-default"
+            f"{start_dt.isoformat()}_{slugify(get_el(13))[:30]}"
+            if start_dt and get_el(13)
+            else start_dt.isoformat() if start_dt
+            else "PERMANENT"
         )
 
         return CourseExtractedSchema(
@@ -363,6 +369,7 @@ class PucpExtractor(BaseExtractor):
             brochure_url_raw=brochure_url,
             start_date_str=start_str,
             end_date_str=end_str,
+            price_details_raw=price_details,
         )
 
 

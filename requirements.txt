@@ -24,6 +24,7 @@ numpy==2.5.4
 openpyxl==3.1.5
 packaging==26.3
 pandas==3.0.6
+playwright==1.56.0
 parso==0.8.7
 platformdirs==4.13.4
 prompt_toolkit==3.0.53

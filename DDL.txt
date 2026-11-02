@@ -1,0 +1,704 @@
+-- =====================================================================
+-- BI Cursos PUCP / Cibertec — DDL completo
+-- =====================================================================
+BEGIN;
+
+-- ---------------------------------------------------------------------
+-- Extensiones
+-- ---------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- búsqueda fuzzy opcional en admin
+
+-- ---------------------------------------------------------------------
+-- DROP limpio (comentar en producción)
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS alert                CASCADE;
+DROP TABLE IF EXISTS quarantine_record    CASCADE;
+DROP TABLE IF EXISTS change_log           CASCADE;
+DROP TABLE IF EXISTS ingestion_log        CASCADE;
+DROP TABLE IF EXISTS raw_page             CASCADE;
+DROP TABLE IF EXISTS course_homologation  CASCADE;
+DROP TABLE IF EXISTS homologation_group   CASCADE;
+DROP TABLE IF EXISTS offering_certificate CASCADE;
+DROP TABLE IF EXISTS certificate_type     CASCADE;
+DROP TABLE IF EXISTS payment_plan         CASCADE;
+DROP TABLE IF EXISTS payment_card         CASCADE;
+DROP TABLE IF EXISTS price_snapshot_discount CASCADE;
+DROP TABLE IF EXISTS discount             CASCADE;
+DROP TABLE IF EXISTS offering_price_tier  CASCADE;
+DROP TABLE IF EXISTS price_snapshot       CASCADE;
+DROP TABLE IF EXISTS offering_schedule    CASCADE;
+DROP TABLE IF EXISTS offering_professor   CASCADE;
+DROP TABLE IF EXISTS course_offering      CASCADE;
+DROP TABLE IF EXISTS course_tech_req_item CASCADE;
+DROP TABLE IF EXISTS course_prerequisite_item CASCADE;
+DROP TABLE IF EXISTS course_content_item  CASCADE;
+DROP TABLE IF EXISTS course_contact       CASCADE;
+DROP TABLE IF EXISTS course               CASCADE;
+DROP TABLE IF EXISTS professor_source_link CASCADE;
+DROP TABLE IF EXISTS professor            CASCADE;
+DROP TABLE IF EXISTS source_segment       CASCADE;
+DROP TABLE IF EXISTS segment              CASCADE;
+DROP TABLE IF EXISTS modality             CASCADE;
+DROP TABLE IF EXISTS category             CASCADE;
+DROP TABLE IF EXISTS source               CASCADE;
+DROP TABLE IF EXISTS user_alert_subscription CASCADE;
+DROP TABLE IF EXISTS user_role            CASCADE;
+DROP TABLE IF EXISTS role                 CASCADE;
+DROP TABLE IF EXISTS app_user             CASCADE;
+DROP TABLE IF EXISTS system_setting       CASCADE;
+
+-- =====================================================================
+-- 1. MAESTROS
+-- =====================================================================
+
+CREATE TABLE source (
+    id          SERIAL PRIMARY KEY,
+    code        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    base_url    TEXT,
+    active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE category (
+    id           SERIAL PRIMARY KEY,
+    parent_id    INT REFERENCES category(id) ON DELETE SET NULL,
+    source_id    INT NOT NULL REFERENCES source(id) ON DELETE RESTRICT,
+    external_id  TEXT,
+    name         TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_category_source_name UNIQUE (source_id, name)
+);
+CREATE INDEX idx_category_parent ON category(parent_id);
+
+CREATE TABLE modality (
+    id            SERIAL PRIMARY KEY,
+    code          TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    is_sync       BOOLEAN NOT NULL DEFAULT TRUE,
+    is_in_person  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE segment (
+    id          SERIAL PRIMARY KEY,
+    code        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE source_segment (
+    id             SERIAL PRIMARY KEY,
+    source_id      INT NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    segment_id     INT NOT NULL REFERENCES segment(id) ON DELETE RESTRICT,
+    external_code  TEXT,
+    external_label TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_source_segment UNIQUE (source_id, segment_id)
+);
+CREATE INDEX idx_source_segment_seg ON source_segment(segment_id);
+
+CREATE TABLE professor (
+    id           BIGSERIAL PRIMARY KEY,
+    full_name    TEXT NOT NULL,
+    email        TEXT,
+    linkedin_url TEXT,
+    phone        TEXT,
+    specialty    TEXT,
+    bio          TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_professor_name ON professor USING gin (full_name gin_trgm_ops);
+
+CREATE TABLE professor_source_link (
+    id           BIGSERIAL PRIMARY KEY,
+    professor_id BIGINT NOT NULL REFERENCES professor(id) ON DELETE CASCADE,
+    source_id    INT NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    external_id  TEXT,
+    profile_url  TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_prof_source UNIQUE (professor_id, source_id)
+);
+CREATE INDEX idx_prof_source_src ON professor_source_link(source_id, external_id);
+
+-- =====================================================================
+-- 2. USUARIOS Y CONFIGURACIÓN
+-- =====================================================================
+
+-- NOTA: en Django usar auth_user (o custom user). Aquí placeholder mínimo.
+CREATE TABLE app_user (
+    id         SERIAL PRIMARY KEY,
+    email      TEXT NOT NULL UNIQUE,
+    full_name  TEXT NOT NULL,
+    is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE role (
+    id          SERIAL PRIMARY KEY,
+    code        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    description TEXT
+);
+
+CREATE TABLE user_role (
+    id         SERIAL PRIMARY KEY,
+    user_id    INT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    role_id    INT NOT NULL REFERENCES role(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_user_role UNIQUE (user_id, role_id)
+);
+
+CREATE TABLE user_alert_subscription (
+    id         SERIAL PRIMARY KEY,
+    user_id    INT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    source_id  INT NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_user_source_alert UNIQUE (user_id, source_id)
+);
+
+CREATE TABLE system_setting (
+    id          SERIAL PRIMARY KEY,
+    key         TEXT NOT NULL UNIQUE,
+    value       TEXT,
+    type        TEXT NOT NULL DEFAULT 'string'
+                 CHECK (type IN ('int','bool','string','json','float')),
+    description TEXT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- =====================================================================
+-- 3. CURSO
+-- =====================================================================
+
+CREATE TABLE course (
+    id                            BIGSERIAL PRIMARY KEY,
+    source_id                     INT NOT NULL REFERENCES source(id) ON DELETE RESTRICT,
+    external_id                   TEXT NOT NULL,
+    name                          TEXT NOT NULL,
+    category_id                   INT REFERENCES category(id) ON DELETE SET NULL,
+    description                   TEXT,
+    course_url                    TEXT,
+    image_url                     TEXT,
+    duration_hours                NUMERIC(7,2) CHECK (duration_hours IS NULL OR duration_hours >= 0),
+    duration_weeks                NUMERIC(5,2) CHECK (duration_weeks IS NULL OR duration_weeks >= 0),
+    sessions_count                INT CHECK (sessions_count IS NULL OR sessions_count >= 0),
+    has_certificate               BOOLEAN NOT NULL DEFAULT FALSE,
+    has_participation_certificate BOOLEAN NOT NULL DEFAULT FALSE,
+    state                         TEXT NOT NULL DEFAULT 'ACTIVE'
+                                   CHECK (state IN ('ACTIVE','INACTIVE','REMOVED')),
+    canonical_hash                TEXT,
+    first_seen_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_course_source_external UNIQUE (source_id, external_id)
+);
+CREATE INDEX idx_course_source_state  ON course(source_id, state);
+CREATE INDEX idx_course_category      ON course(category_id);
+CREATE INDEX idx_course_name_trgm     ON course USING gin (name gin_trgm_ops);
+
+CREATE TABLE course_contact (
+    id         BIGSERIAL PRIMARY KEY,
+    course_id  BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    name       TEXT,
+    phone      TEXT,
+    email      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_course_contact UNIQUE (course_id)
+);
+
+CREATE TABLE course_content_item (
+    id        BIGSERIAL PRIMARY KEY,
+    course_id BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    position  INT NOT NULL DEFAULT 0,
+    text      TEXT NOT NULL,
+    CONSTRAINT uq_content_course_pos UNIQUE (course_id, position)
+);
+
+CREATE TABLE course_prerequisite_item (
+    id        BIGSERIAL PRIMARY KEY,
+    course_id BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    position  INT NOT NULL DEFAULT 0,
+    text      TEXT NOT NULL,
+    CONSTRAINT uq_prereq_course_pos UNIQUE (course_id, position)
+);
+
+CREATE TABLE course_tech_req_item (
+    id        BIGSERIAL PRIMARY KEY,
+    course_id BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    position  INT NOT NULL DEFAULT 0,
+    kind      TEXT NOT NULL CHECK (kind IN ('HW','SW')),
+    text      TEXT NOT NULL,
+    CONSTRAINT uq_tech_course_pos UNIQUE (course_id, position)
+);
+
+-- =====================================================================
+-- 4. OFERTA (cohorte)
+-- =====================================================================
+
+CREATE TABLE course_offering (
+    id                   BIGSERIAL PRIMARY KEY,
+    course_id            BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    external_code        TEXT,
+    modality_id          INT REFERENCES modality(id) ON DELETE SET NULL,
+    start_date           DATE,
+    end_date             DATE,
+    enrollment_open_at   TIMESTAMPTZ,
+    enrollment_close_at  TIMESTAMPTZ,
+    duration_hours       NUMERIC(7,2) CHECK (duration_hours IS NULL OR duration_hours >= 0),
+    duration_weeks       NUMERIC(5,2) CHECK (duration_weeks IS NULL OR duration_weeks >= 0),
+    sessions_count       INT CHECK (sessions_count IS NULL OR sessions_count >= 0),
+    seats_total          INT CHECK (seats_total IS NULL OR seats_total >= 0),
+    seats_available      INT CHECK (seats_available IS NULL OR seats_available >= 0),
+    enrollment_fee       NUMERIC(10,2) CHECK (enrollment_fee IS NULL OR enrollment_fee >= 0),
+    state                TEXT NOT NULL DEFAULT 'ACTIVE'
+                          CHECK (state IN ('ACTIVE','CANCELLED','FINISHED')),
+    canonical_hash       TEXT,
+    first_seen_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_offering_seats CHECK (
+        seats_available IS NULL OR seats_total IS NULL OR seats_available <= seats_total
+    ),
+    CONSTRAINT chk_offering_dates CHECK (
+        start_date IS NULL OR end_date IS NULL OR end_date >= start_date
+    )
+);
+CREATE UNIQUE INDEX uq_offering_course_external
+    ON course_offering(course_id, external_code)
+    WHERE external_code IS NOT NULL;
+CREATE INDEX idx_offering_course_state ON course_offering(course_id, state);
+CREATE INDEX idx_offering_start        ON course_offering(start_date);
+CREATE INDEX idx_offering_modality     ON course_offering(modality_id);
+
+CREATE TABLE offering_professor (
+    id           BIGSERIAL PRIMARY KEY,
+    offering_id  BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    professor_id BIGINT NOT NULL REFERENCES professor(id) ON DELETE RESTRICT,
+    role         TEXT NOT NULL DEFAULT 'TITULAR'
+                  CHECK (role IN ('TITULAR','CO_DOCENTE','INVITADO')),
+    CONSTRAINT uq_offering_prof_role UNIQUE (offering_id, professor_id, role)
+);
+CREATE INDEX idx_offering_prof_prof ON offering_professor(professor_id);
+
+CREATE TABLE offering_schedule (
+    id           BIGSERIAL PRIMARY KEY,
+    offering_id  BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    day_of_week  SMALLINT NOT NULL CHECK (day_of_week BETWEEN 1 AND 7),
+    start_time   TIME NOT NULL,
+    end_time     TIME NOT NULL,
+    CONSTRAINT chk_schedule_times CHECK (end_time > start_time)
+);
+CREATE INDEX idx_schedule_offering ON offering_schedule(offering_id);
+
+-- =====================================================================
+-- 5. PRECIOS
+-- =====================================================================
+
+CREATE TABLE price_snapshot (
+    id               BIGSERIAL PRIMARY KEY,
+    offering_id      BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    currency         CHAR(3) NOT NULL DEFAULT 'PEN' CHECK (currency IN ('PEN','USD')),
+    list_amount      NUMERIC(10,2) NOT NULL CHECK (list_amount >= 0),
+    final_amount     NUMERIC(10,2) NOT NULL CHECK (final_amount >= 0),
+    tax_included     BOOLEAN NOT NULL DEFAULT TRUE,
+    valid_from       TIMESTAMPTZ NOT NULL,
+    valid_to         TIMESTAMPTZ,
+    is_current       BOOLEAN GENERATED ALWAYS AS (valid_to IS NULL) STORED,
+    snapshot_reason  TEXT NOT NULL DEFAULT 'INITIAL'
+                      CHECK (snapshot_reason IN ('INITIAL','CHANGE_DETECTED','MANUAL')),
+    raw_payload      JSONB,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_price_valid CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+CREATE UNIQUE INDEX uq_price_snapshot_current ON price_snapshot(offering_id) WHERE is_current = TRUE;
+CREATE INDEX idx_price_snapshot_offering ON price_snapshot(offering_id, valid_from DESC);
+
+CREATE TABLE offering_price_tier (
+    id           BIGSERIAL PRIMARY KEY,
+    offering_id  BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    segment_id   INT NOT NULL REFERENCES segment(id) ON DELETE RESTRICT,
+    amount       NUMERIC(10,2) NOT NULL CHECK (amount >= 0),
+    currency     CHAR(3) NOT NULL DEFAULT 'PEN' CHECK (currency IN ('PEN','USD')),
+    notes        TEXT,
+    valid_from   TIMESTAMPTZ NOT NULL,
+    valid_to     TIMESTAMPTZ,
+    is_current   BOOLEAN GENERATED ALWAYS AS (valid_to IS NULL) STORED,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_tier_valid CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+CREATE UNIQUE INDEX uq_tier_current
+    ON offering_price_tier(offering_id, segment_id) WHERE is_current = TRUE;
+CREATE INDEX idx_tier_offering ON offering_price_tier(offering_id);
+
+CREATE TABLE discount (
+    id           BIGSERIAL PRIMARY KEY,
+    source_id    INT NOT NULL REFERENCES source(id) ON DELETE RESTRICT,
+    course_id    BIGINT REFERENCES course(id) ON DELETE CASCADE,
+    offering_id  BIGINT REFERENCES course_offering(id) ON DELETE CASCADE,
+    segment_id   INT REFERENCES segment(id) ON DELETE SET NULL,
+    kind         TEXT NOT NULL CHECK (kind IN ('PERCENT','FIXED')),
+    value        NUMERIC(10,2) NOT NULL CHECK (value > 0),
+    description  TEXT,
+    conditions   TEXT,
+    stackable    BOOLEAN NOT NULL DEFAULT FALSE,
+    valid_from   DATE,
+    valid_to     DATE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_discount_scope CHECK (
+        (course_id IS NOT NULL AND offering_id IS NULL) OR
+        (course_id IS NULL AND offering_id IS NOT NULL)
+    ),
+    CONSTRAINT chk_discount_pct CHECK (
+        kind <> 'PERCENT' OR (value > 0 AND value <= 100)
+    ),
+    CONSTRAINT chk_discount_dates CHECK (
+        valid_from IS NULL OR valid_to IS NULL OR valid_to >= valid_from
+    )
+);
+CREATE INDEX idx_discount_course   ON discount(course_id);
+CREATE INDEX idx_discount_offering ON discount(offering_id);
+CREATE INDEX idx_discount_segment  ON discount(segment_id);
+
+CREATE TABLE price_snapshot_discount (
+    id                BIGSERIAL PRIMARY KEY,
+    price_snapshot_id BIGINT NOT NULL REFERENCES price_snapshot(id) ON DELETE CASCADE,
+    discount_id       BIGINT NOT NULL REFERENCES discount(id) ON DELETE CASCADE,
+    applied           BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT uq_ps_discount UNIQUE (price_snapshot_id, discount_id)
+);
+
+-- =====================================================================
+-- 6. PLANES DE PAGO
+-- =====================================================================
+
+CREATE TABLE payment_card (
+    id         SERIAL PRIMARY KEY,
+    bank       TEXT NOT NULL,
+    brand      TEXT NOT NULL CHECK (brand IN ('VISA','MC','AMEX','DINERS','OTRO')),
+    name       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_card_bank_brand UNIQUE (bank, brand)
+);
+
+CREATE TABLE payment_plan (
+    id                 BIGSERIAL PRIMARY KEY,
+    offering_id        BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    card_id            INT NOT NULL REFERENCES payment_card(id) ON DELETE RESTRICT,
+    installments       INT NOT NULL CHECK (installments >= 1),
+    installment_amount NUMERIC(10,2) NOT NULL CHECK (installment_amount >= 0),
+    total_amount       NUMERIC(10,2) NOT NULL CHECK (total_amount >= 0),
+    interest_rate      NUMERIC(6,3) NOT NULL DEFAULT 0 CHECK (interest_rate >= 0),
+    currency           CHAR(3) NOT NULL DEFAULT 'PEN' CHECK (currency IN ('PEN','USD')),
+    valid_from         TIMESTAMPTZ NOT NULL,
+    valid_to           TIMESTAMPTZ,
+    is_current         BOOLEAN GENERATED ALWAYS AS (valid_to IS NULL) STORED,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_plan_valid CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+CREATE UNIQUE INDEX uq_plan_current
+    ON payment_plan(offering_id, card_id, installments) WHERE is_current = TRUE;
+CREATE INDEX idx_plan_offering ON payment_plan(offering_id);
+
+-- =====================================================================
+-- 7. CERTIFICADOS
+-- =====================================================================
+
+CREATE TABLE certificate_type (
+    id   SERIAL PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL
+);
+
+CREATE TABLE offering_certificate (
+    id                  BIGSERIAL PRIMARY KEY,
+    offering_id         BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    certificate_type_id INT NOT NULL REFERENCES certificate_type(id) ON DELETE RESTRICT,
+    price               NUMERIC(10,2) NOT NULL DEFAULT 0 CHECK (price >= 0),
+    currency            CHAR(3) NOT NULL DEFAULT 'PEN' CHECK (currency IN ('PEN','USD')),
+    requires_approval   BOOLEAN NOT NULL DEFAULT TRUE,
+    optional            BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_offering_cert UNIQUE (offering_id, certificate_type_id)
+);
+
+-- =====================================================================
+-- 8. HOMOLOGACIÓN (agrupación manual PUCP vs Cibertec)
+-- =====================================================================
+
+CREATE TABLE homologation_group (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    category_id INT REFERENCES category(id) ON DELETE SET NULL,
+    notes       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE course_homologation (
+    id             BIGSERIAL PRIMARY KEY,
+    course_id      BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    group_id       INT NOT NULL REFERENCES homologation_group(id) ON DELETE CASCADE,
+    approved_by_id INT REFERENCES app_user(id) ON DELETE SET NULL,
+    approved_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_course_group UNIQUE (course_id, group_id)
+);
+CREATE INDEX idx_homolog_group ON course_homologation(group_id);
+
+-- =====================================================================
+-- 9. CALIDAD / AUDITORÍA
+-- =====================================================================
+
+CREATE TABLE raw_page (
+    id           BIGSERIAL PRIMARY KEY,
+    source_id    INT NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    url          TEXT,
+    html_sha256  TEXT NOT NULL,
+    html         BYTEA,
+    fetched_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_raw_page_source_date ON raw_page(source_id, fetched_at DESC);
+
+CREATE TABLE ingestion_log (
+    id           BIGSERIAL PRIMARY KEY,
+    source_id    INT NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL CHECK (status IN ('OK','PARTIAL','FAILED')),
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at  TIMESTAMPTZ,
+    counts       JSONB,
+    error_msg    TEXT
+);
+CREATE INDEX idx_ingestion_source_date ON ingestion_log(source_id, started_at DESC);
+
+CREATE TABLE change_log (
+    id            BIGSERIAL PRIMARY KEY,
+    entity_type   TEXT NOT NULL,
+    entity_id     BIGINT NOT NULL,
+    action        TEXT NOT NULL CHECK (action IN ('CREATED','UPDATED','REMOVED')),
+    diff          JSONB,
+    ingestion_id  BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
+    user_id       INT REFERENCES app_user(id) ON DELETE SET NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_change_entity ON change_log(entity_type, entity_id, created_at DESC);
+CREATE INDEX idx_change_created ON change_log(created_at DESC);
+
+CREATE TABLE quarantine_record (
+    id           BIGSERIAL PRIMARY KEY,
+    source_id    INT NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    ingestion_id BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
+    raw_payload  JSONB,
+    errors       JSONB NOT NULL,
+    reviewed     BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_quarantine_source ON quarantine_record(source_id, created_at DESC);
+CREATE INDEX idx_quarantine_pending ON quarantine_record(source_id) WHERE reviewed = FALSE;
+
+CREATE TABLE alert (
+    id           BIGSERIAL PRIMARY KEY,
+    ingestion_id BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
+    severity     TEXT NOT NULL CHECK (severity IN ('INFO','WARN','CRITICAL')),
+    type         TEXT NOT NULL CHECK (type IN (
+                    'HTTP_ERROR','VALIDATION','REMOVED','STALE','CONSECUTIVE_FAIL'
+                 )),
+    message      TEXT,
+    entity_ref   TEXT,
+    channel_sent JSONB,
+    resolved_at  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_alert_created  ON alert(created_at DESC);
+CREATE INDEX idx_alert_severity ON alert(severity, created_at DESC);
+CREATE INDEX idx_alert_open     ON alert(created_at DESC) WHERE resolved_at IS NULL;
+
+-- =====================================================================
+-- 10. TRIGGERS
+-- =====================================================================
+
+-- Cierre automático del "current" anterior: precio por offering
+CREATE OR REPLACE FUNCTION fn_close_prev_price_snapshot()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.valid_to IS NULL THEN
+        UPDATE price_snapshot
+           SET valid_to = COALESCE(NEW.valid_from, now())
+         WHERE offering_id = NEW.offering_id
+           AND valid_to IS NULL
+           AND (TG_OP = 'INSERT' OR id <> NEW.id);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tg_price_snapshot_close_prev
+BEFORE INSERT OR UPDATE ON price_snapshot
+FOR EACH ROW EXECUTE FUNCTION fn_close_prev_price_snapshot();
+
+-- Cierre del tier anterior: (offering, segment)
+CREATE OR REPLACE FUNCTION fn_close_prev_offering_price_tier()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.valid_to IS NULL THEN
+        UPDATE offering_price_tier
+           SET valid_to = COALESCE(NEW.valid_from, now())
+         WHERE offering_id = NEW.offering_id
+           AND segment_id  = NEW.segment_id
+           AND valid_to IS NULL
+           AND (TG_OP = 'INSERT' OR id <> NEW.id);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tg_offering_price_tier_close_prev
+BEFORE INSERT OR UPDATE ON offering_price_tier
+FOR EACH ROW EXECUTE FUNCTION fn_close_prev_offering_price_tier();
+
+-- Cierre del plan anterior: (offering, card, installments)
+CREATE OR REPLACE FUNCTION fn_close_prev_payment_plan()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.valid_to IS NULL THEN
+        UPDATE payment_plan
+           SET valid_to = COALESCE(NEW.valid_from, now())
+         WHERE offering_id  = NEW.offering_id
+           AND card_id      = NEW.card_id
+           AND installments = NEW.installments
+           AND valid_to IS NULL
+           AND (TG_OP = 'INSERT' OR id <> NEW.id);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tg_payment_plan_close_prev
+BEFORE INSERT OR UPDATE ON payment_plan
+FOR EACH ROW EXECUTE FUNCTION fn_close_prev_payment_plan();
+
+-- updated_at genérico
+CREATE OR REPLACE FUNCTION fn_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tg_professor_updated   BEFORE UPDATE ON professor       FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+CREATE TRIGGER tg_course_updated      BEFORE UPDATE ON course          FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+CREATE TRIGGER tg_offering_updated    BEFORE UPDATE ON course_offering FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+CREATE TRIGGER tg_setting_updated     BEFORE UPDATE ON system_setting  FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+-- =====================================================================
+-- 11. COMENTARIOS
+-- =====================================================================
+COMMENT ON TABLE  source                   IS 'Fuente del curso: PUCP, CIBERTEC, etc.';
+COMMENT ON TABLE  category                 IS 'Categoría tal cual la publica cada fuente; el admin puede agrupar vía homologation_group.';
+COMMENT ON TABLE  segment                  IS 'Maestro de segmentos de alumno (estudiante PUCP, ASOCEGRE, empresas…).';
+COMMENT ON TABLE  source_segment           IS 'Homologación del label de segmento que usa cada fuente.';
+COMMENT ON TABLE  professor                IS 'Docente unificado; puede tener N perfiles por fuente.';
+COMMENT ON TABLE  professor_source_link    IS 'Perfil del docente en una fuente concreta (URL, id externo).';
+COMMENT ON TABLE  course                   IS 'Catálogo base del curso. Sus precios y cohortes van en course_offering.';
+COMMENT ON TABLE  course_offering          IS 'Instancia/cohorte del curso (mensual, trimestral, etc.). Cambios de precio no van aquí, van en price_snapshot.';
+COMMENT ON TABLE  price_snapshot           IS 'Histórico de precios por offering. Solo uno con is_current=TRUE por offering (trigger + índice parcial).';
+COMMENT ON TABLE  offering_price_tier      IS 'Precio publicado por segmento (ej. Comunidad PUCP = S/370). También con histórico.';
+COMMENT ON TABLE  discount                 IS 'Descuentos condicionales (% o fijo). stackable indica si se puede combinar.';
+COMMENT ON TABLE  payment_plan             IS 'Plan de N cuotas asociado a una tarjeta. Un plan vigente por (offering, card, installments).';
+COMMENT ON TABLE  offering_certificate     IS 'Costo y condición del certificado / constancia por cohorte.';
+COMMENT ON TABLE  homologation_group       IS 'Agrupación manual de cursos equivalentes entre fuentes para comparar en el BI.';
+COMMENT ON TABLE  change_log               IS 'Auditoría: quién cambió qué y cuándo, con diff JSON.';
+COMMENT ON TABLE  quarantine_record        IS 'Filas que fallaron validación Pydantic: no contaminan el catálogo.';
+COMMENT ON TABLE  alert                    IS 'Alertas operativas (fallo de red, validación, fuente caída). Se envían por email a usuarios suscritos.';
+
+-- =====================================================================
+-- 12. SEED DATA
+-- =====================================================================
+
+INSERT INTO modality (code, name, is_sync, is_in_person) VALUES
+    ('VIRTUAL_SINC',   'Virtual sincrónico',   TRUE,  FALSE),
+    ('VIRTUAL_ASINC',  'Virtual asincrónico',  FALSE, FALSE),
+    ('PRESENCIAL',     'Presencial',           TRUE,  TRUE),
+    ('HIBRIDO',        'Híbrido',              TRUE,  TRUE)
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO certificate_type (code, name) VALUES
+    ('CERTIFICADO',              'Certificado'),
+    ('CONSTANCIA_PARTICIPACION', 'Constancia de participación')
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO segment (code, name, description) VALUES
+    ('PUBLICO_GENERAL',        'Público general',                'Sin condiciones especiales'),
+    ('PUCP_PREGRADO',          'Comunidad PUCP - Pregrado',      'Alumnos pregrado PUCP'),
+    ('PUCP_POSGRADO',          'Comunidad PUCP - Posgrado',      'Alumnos posgrado PUCP'),
+    ('PUCP_EGRESADO',          'Comunidad PUCP - Egresado',      'Egresados PUCP'),
+    ('PUCP_DOCENTE',           'Comunidad PUCP - Docente',       'Docentes PUCP'),
+    ('PUCP_COLABORADOR',       'Comunidad PUCP - Colaborador',   'Colaboradores PUCP'),
+    ('OTRA_UNIV_PREGRADO',     'Alumnos pregrado otras univ.',   'Pregrado de otra universidad'),
+    ('ASOCEGRE',               'Asociado Hábil (ASOCEGRE)',      'Miembros ASOCEGRE'),
+    ('INSTITUCION_CONVENIO',   'Institución educativa en convenio', 'Colegios / institutos con convenio'),
+    ('EMPRESA_CONVENIO',       'Empresa en convenio',            'Empresas con convenio corporativo')
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO role (code, name, description) VALUES
+    ('ADMIN',    'Administrador', 'Acceso total, gestiona usuarios, roles, settings'),
+    ('ANALISTA', 'Analista',      'Consulta, filtra KPIs, exporta reportes, homologa'),
+    ('INGESTOR', 'Ingestor',      'Solo ejecuta ETL / ingesta')
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO system_setting (key, value, type, description) VALUES
+    ('consecutive_failures_threshold', '2',   'int',    'Corridas consecutivas fallidas antes de alertar fuente caída'),
+    ('retention_raw_page_days',        '90',  'int',    'Días de retención del HTML crudo'),
+    ('retention_snapshot_days',        '',    'int',    'Días de retención de price_snapshot (vacío = infinito)'),
+    ('etl_frequency_days',             '1',   'int',    'Frecuencia de corrida automática (1, 3, etc.)'),
+    ('alert_email_enabled',            'true','bool',   'Habilitar envío de correos de alerta'),
+    ('email_from',                     'bi-cursos@example.com', 'string', 'Remitente de alertas')
+ON CONFLICT (key) DO NOTHING;
+
+COMMIT;
+
+-- =====================================================================
+-- 13. VERIFICACIÓN RÁPIDA
+-- =====================================================================
+-- SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1;
+-- SELECT * FROM modality;
+-- SELECT * FROM certificate_type;
+-- SELECT * FROM segment;
+-- SELECT * FROM system_setting;
+
+
+-- =====================================================================
+-- 14. CORRECCIONES FINALES
+-- =====================================================================
+
+BEGIN;
+
+-- 1. Control de salud, fallos y programación independiente por fuente
+ALTER TABLE source 
+    ADD COLUMN IF NOT EXISTS health_status TEXT NOT NULL DEFAULT 'HEALTHY' 
+        CHECK (health_status IN ('HEALTHY', 'RETRYING', 'BROKEN_DOM', 'DOWN')),
+    ADD COLUMN IF NOT EXISTS consecutive_failures INT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS frequency_days INT NOT NULL DEFAULT 7,
+    ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- 2. Ampliar tipos de alerta para detectar cambio de estructura HTML (DOM Drift)
+ALTER TABLE alert DROP CONSTRAINT IF EXISTS alert_type_check;
+ALTER TABLE alert ADD CONSTRAINT alert_type_check 
+    CHECK (type IN ('HTTP_ERROR', 'DOM_STRUCTURE_CHANGED', 'ZERO_RESULTS', 'VALIDATION', 'REMOVED', 'STALE', 'CONSECUTIVE_FAIL'));
+
+-- 3. Parámetros operativos en system_setting
+INSERT INTO system_setting (key, value, type, description) VALUES
+    ('retry_interval_hours', '8', 'int', 'Horas de espera para reintentar cuando falla una extracción o devuelve 0 cursos'),
+    ('consecutive_failures_threshold', '3', 'int', 'Intentos fallidos antes de declarar la fuente BROKEN_DOM/DOWN y enviar correo'),
+    ('min_courses_threshold_pct', '20', 'int', 'Porcentaje mínimo de cursos respecto a la última corrida exitosa para no declarar caída parcial de DOM'),
+    ('retention_raw_page_days', '90', 'int', 'Días de retención del HTML crudo en raw_page antes de purgar')
+ON CONFLICT (key) DO UPDATE 
+    SET value = EXCLUDED.value, 
+        description = EXCLUDED.description;
+
+COMMIT;
