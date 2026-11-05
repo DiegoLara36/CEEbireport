@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from etl.extractors.cibertec import CibertecExtractor
 from etl.extractors.pucp import PucpExtractor
+from etl.persistence.repositories import PriceRepository
 from etl.schemas import (
     ContactSchema,
     CourseExtractedSchema,
@@ -377,7 +378,7 @@ class EtlEnginePureLogicBaselineTests(SimpleTestCase):
             final_amount=Decimal("490"),
         )
 
-        snapshot_id = engine._persist_price(cursor, 9, 2, 6, offering)
+        snapshot_id = PriceRepository()._persist_snapshot(cursor, 9, 6, offering)
 
         self.assertEqual(snapshot_id, 15)
         cursor.execute.assert_called_once()
@@ -391,7 +392,7 @@ class EtlEnginePureLogicBaselineTests(SimpleTestCase):
             final_amount=Decimal("490"),
         )
 
-        snapshot_id = engine._persist_price(cursor, 9, 2, 6, offering)
+        snapshot_id = PriceRepository()._persist_snapshot(cursor, 9, 6, offering)
 
         self.assertEqual(snapshot_id, 16)
         sql_calls = [call.args[0] for call in cursor.execute.call_args_list]
