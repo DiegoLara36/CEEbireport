@@ -14,7 +14,10 @@ from etl.schemas import (
     ScrapedDiscountDTO,
     ScrapedOfferingDTO,
     ScrapedPaymentPlanDTO,
+    ObservationStatus,
 )
+from etl.adapters import adapt_cibertec_course
+from etl.normalization import normalize_amount, normalize_currency
 
 
 MONTHS_ES = {
@@ -94,17 +97,7 @@ def parse_cibertec_schedule(value: Optional[str]) -> list[ScheduleItemSchema]:
 
 
 def _money(text: Optional[str]) -> Optional[Decimal]:
-    if not text:
-        return None
-    match = re.search(r"([\d.,]+)", text.replace(" ", ""))
-    if not match:
-        return None
-    number = match.group(1)
-    if "," in number and "." in number:
-        number = number.replace(",", "")
-    elif "," in number:
-        number = number.replace(",", ".")
-    return Decimal(number)
+    return normalize_amount(text)
 
 
 def _duration(text: Optional[str]) -> tuple[Optional[Decimal], Optional[Decimal]]:
@@ -322,12 +315,20 @@ class CibertecExtractor:
         breadcrumb = soup.select("nav[aria-label='Breadcrumb'] a")
         category = breadcrumb[-1].get_text(" ", strip=True) if len(breadcrumb) > 2 else fallback_category
         modality_text = page_text.lower()
+        badges = [li.get_text(" ", strip=True) for li in soup.select("ul li")]
+        modality_raw = next(
+            (
+                badge
+                for badge in badges
+                if re.search(r"virtual|presencial|h[ií]brid[oa]|semipresencial", badge, re.I)
+            ),
+            None,
+        )
         modality = (
             "PRESENCIAL" if "presencial" in modality_text and "virtual" not in modality_text
             else "HIBRIDO" if "híbrido" in modality_text or "hibrido" in modality_text
             else "VIRTUAL_SINC"
         )
-        badges = [li.get_text(" ", strip=True) for li in soup.select("ul li")]
         benefits = next(
             (text for text in badges if re.search(r"cuotas|tarjeta|sin intereses", text, re.I)),
             "",
@@ -343,7 +344,11 @@ class CibertecExtractor:
             for node in soup.select("p, span, strong")
             if not node.find_parent(class_="line-through")
             and "line-through" not in node.get("class", [])
-            and re.search(r"(?:S\s*/\.?|PEN)\s*[\d.,]+", node.get_text(" ", strip=True), re.I)
+            and re.search(
+                r"(?:S\s*/\.?|[$€£]|\b[A-Z]{3}\b)\s*\d[\d.,]*",
+                node.get_text(" ", strip=True),
+                re.I,
+            )
             and _money(node.get_text(" ", strip=True)) is not None
         ]
         final_amount = (
@@ -351,8 +356,30 @@ class CibertecExtractor:
             if current_candidates
             else _money(listing.get("current_price")) or list_amount
         )
-        list_amount = list_amount or final_amount or Decimal(0)
-        final_amount = final_amount or list_amount
+        if list_amount is None:
+            list_amount = final_amount
+        if final_amount is None:
+            final_amount = list_amount
+        current_price_text = next(
+            (
+                node.get_text(" ", strip=True)
+                for node in reversed(soup.select("p, span, strong"))
+                if not node.find_parent(class_="line-through")
+                and "line-through" not in node.get("class", [])
+                and re.search(
+                    r"(?:S\s*/\.?|US\s*\$|[$€£]|\b[A-Z]{3}\b)\s*\d[\d.,]*",
+                    node.get_text(" ", strip=True),
+                    re.I,
+                )
+            ),
+            listing.get("current_price"),
+        )
+        list_price_text = (
+            list_node.get_text(" ", strip=True)
+            if list_node
+            else listing.get("list_price")
+        )
+        currency_raw = current_price_text or list_price_text
 
         discount_text_node = soup.find(
             string=re.compile(
@@ -399,17 +426,61 @@ class CibertecExtractor:
             offerings.append(ScrapedOfferingDTO(
                 external_code=external_code,
                 modality_code=modality,
+                modality_raw=modality_raw,
+                modality_observation=(
+                    ObservationStatus.OBSERVED
+                    if modality_raw
+                    else ObservationStatus.UNKNOWN
+                ),
                 start_date=start_date,
+                start_date_observation=(
+                    ObservationStatus.OBSERVED
+                    if start_date
+                    else ObservationStatus.UNKNOWN
+                    if cohort.get("start_text")
+                    else ObservationStatus.NOT_COLLECTED
+                ),
+                end_date_observation=ObservationStatus.NOT_COLLECTED,
                 duration_hours=duration_hours,
                 duration_weeks=duration_weeks,
+                duration_observation=(
+                    ObservationStatus.OBSERVED
+                    if duration_hours is not None or duration_weeks is not None
+                    else ObservationStatus.UNKNOWN
+                    if cohort.get("duration_text") or listing.get("duration_text")
+                    else ObservationStatus.NOT_COLLECTED
+                ),
                 schedules=schedules,
+                schedules_observation=(
+                    ObservationStatus.OBSERVED
+                    if schedules
+                    else ObservationStatus.UNKNOWN
+                    if schedule_text
+                    else ObservationStatus.NOT_COLLECTED
+                ),
                 schedule_text=schedule_text,
-                currency="PEN",
+                currency=normalize_currency(currency_raw),
+                currency_raw=currency_raw,
+                currency_observation=(
+                    ObservationStatus.OBSERVED
+                    if normalize_currency(currency_raw)
+                    else ObservationStatus.UNKNOWN
+                ),
                 list_amount=list_amount,
                 final_amount=final_amount,
+                price_observation=(
+                    ObservationStatus.OBSERVED
+                    if list_amount is not None or final_amount is not None
+                    else ObservationStatus.NOT_FOUND
+                ),
                 discounts=discounts,
                 payment_plans=self._payment_plans(benefits),
-                raw_payload={"cohort": cohort, "benefits": benefits},
+                raw_payload={
+                    "cohort": cohort,
+                    "benefits": benefits,
+                    "duration_text": cohort.get("duration_text") or listing.get("duration_text"),
+                    "price_text": currency_raw,
+                },
             ))
 
         content_items = []
@@ -434,7 +505,7 @@ class CibertecExtractor:
         participation_certificate = "constancia" in page_text.lower()
         parsed_url = urlparse(url)
         external_id = parsed_url.path.rstrip("/").split("/")[-1]
-        return ScrapedCourseDTO(
+        course = ScrapedCourseDTO(
             source_code=self.source_code,
             external_id=external_id,
             course_url=url,
@@ -443,14 +514,46 @@ class CibertecExtractor:
             description=description,
             has_certificate=certificate,
             has_participation_certificate=participation_certificate,
+            certificate_observation=(
+                ObservationStatus.OBSERVED
+                if certificate
+                else ObservationStatus.NOT_FOUND
+            ),
+            participation_certificate_observation=(
+                ObservationStatus.OBSERVED
+                if participation_certificate
+                else ObservationStatus.NOT_FOUND
+            ),
             content_items=content_items,
+            content_observation=(
+                ObservationStatus.OBSERVED
+                if content_items
+                else ObservationStatus.NOT_COLLECTED
+            ),
             prerequisite_items=prerequisites,
+            prerequisites_observation=(
+                ObservationStatus.OBSERVED
+                if prerequisites
+                else ObservationStatus.NOT_COLLECTED
+            ),
             hardware_requirements=hardware,
+            hardware_observation=(
+                ObservationStatus.OBSERVED
+                if hardware
+                else ObservationStatus.NOT_COLLECTED
+            ),
             software_requirements=software,
+            software_observation=(
+                ObservationStatus.OBSERVED
+                if software
+                else ObservationStatus.NOT_COLLECTED
+            ),
             duration_hours=offerings[0].duration_hours,
+            duration_observation=offerings[0].duration_observation,
             offerings=offerings,
             raw_payload={"benefits": benefits, "modules": modules or [], "cohorts": parsed_cohorts},
         )
+        return adapt_cibertec_course(course)
 
     @staticmethod
     def _list_after_heading(soup: BeautifulSoup, heading_pattern: str) -> list[str]:

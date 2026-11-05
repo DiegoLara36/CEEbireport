@@ -242,5 +242,19 @@ corrigió el fixture, no el código de producción, y se repitió la suite con
 6. Diseñar historia de versiones completas de curso/oferta por encima del
    `change_log`; los hashes actuales no cubren todos los atributos acordados.
 
-La Fase 2 no se ha iniciado. Se requiere autorización antes de modificar lógica
-de producción o esquema de PostgreSQL.
+## Aclaración posterior a la Fase 2
+
+Las recomendaciones anteriores registran lo que quedaba pendiente al cerrar la
+línea base; no describen el estado actual. La Fase 2 agregó docentes y contactos
+al DTO común y los transfiere desde PUCP. Cibertec marca esos campos como
+`NOT_COLLECTED`. Ninguno se persiste todavía. El DTO común, los adaptadores y
+normalizadores ahora están documentados en `ARCHITECTURE_DECISIONS.md` y
+`REFACTORING_PLAN.md`.
+
+Siguen pendientes para la Fase 3: cambiar el hash usado por `ETLEngine`,
+persistir atributos relevantes y su historial, completar integración de datos
+que no existen en los esquemas actuales (por ejemplo, fecha final Cibertec) y
+realizar pruebas aisladas contra PostgreSQL. Cibertec ya no sustituye un precio
+ausente por `0`; sin embargo, el ETL/DDL vigente requiere un precio para la
+persistencia, así que ese registro incompleto debe tratarse en la futura fase
+de persistencia. No se modificó la persistencia ni el DDL en la Fase 2.

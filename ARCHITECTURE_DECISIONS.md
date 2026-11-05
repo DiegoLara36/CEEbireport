@@ -11,9 +11,10 @@ es conservar las capturas funcionales de PUCP y Cibertec.
 - `etl/extractors/pucp.py` usa `requests`/BeautifulSoup y contiene además
   `PucpETLService`, otra ruta SQL que no invocan los comandos actuales.
 - `etl/extractors/cibertec.py` usa Playwright y construye `ScrapedCourseDTO`.
-- `etl/schemas.py` declara DTOs Pydantic. `CourseExtractedSchema` incluye un
-  profesor y un contacto, pero el DTO común no los incluye; el adaptador
-  `pucp_course_to_dto()` no los transfiere.
+- `etl/schemas.py` declara contratos Pydantic específicos y comunes. Desde la
+  Fase 2, el DTO común incluye docentes, contactos y estados de observación;
+  `etl/adapters.py` adapta PUCP y Cibertec, con normalizadores en
+  `etl/normalization.py`.
 - `catalog/management/commands/run_ingestion.py` admite selección por fuente y
   `--force`. Consulta `next_run_at`, pero no implementa por sí solo un reloj,
   lock de ejecución ni recuperación de procesos abandonados.
@@ -144,8 +145,11 @@ ISO 4217. Los reportes no sumarán ni compararán importes de monedas distintas
 como si fueran equivalentes. Una conversión futura requerirá tabla de tipos de
 cambio históricos y fecha/fuente de conversión; no se introduce ahora.
 
-El DTO y el DDL actuales restringen moneda a `PEN`/`USD`; ampliar a códigos
-ISO exige acordar validación y constraints sin perder importes existentes.
+El DTO de Fase 2 conserva códigos alfabéticos de tres letras y reconoce
+símbolos inequívocos; el DDL operativo sigue restringido a `PEN`/`USD`.
+Ampliar la persistencia a otros códigos ISO requiere actualizar y probar sus
+constraints sin perder importes existentes. La validación Pydantic comprueba el
+formato, no la asignación del código en el registro ISO.
 
 ### ADR-10 — Metabase y seguridad de integración
 
@@ -158,14 +162,48 @@ Antes de implementar, confirmar en la instancia objetivo versión, edición,
 licencia y capacidades de embedding. La base de datos de metadatos de Metabase
 será distinta de la base de negocio consultada.
 
+## Estado al cierre de la Fase 2
+
+- `etl/schemas.py` separa el contrato de extracción PUCP del DTO común de
+  curso/ofertas y conserva los campos planos que consume `ETLEngine`. El DTO
+  común agrega docentes, contactos, certificados, requisitos, categoría
+  normalizada, modalidad normalizada, duración con unidad y estados de
+  observación (`OBSERVED`, `NOT_FOUND`, `NOT_COLLECTED`, `UNKNOWN`).
+- `etl/adapters.py` transforma los contratos PUCP y Cibertec. Las funciones
+  independientes de HTML están en `etl/normalization.py`: fechas con año
+  explícito, importes decimales, moneda solo con evidencia suficiente,
+  unidades de duración, modalidad y categoría.
+- Se conservan los códigos de modalidad existentes para la persistencia; los
+  valores normalizados son campos distintos. Categoría normalizada no implica
+  homologación: `homologation_code` queda sin asignar.
+- `ScrapedCourseDTO.canonical_fingerprint()` crea una huella determinista del
+  contenido normalizado, ignorando los payloads crudos y ordenando horarios.
+  Es una API de datos para pruebas y evolución; `ETLEngine` todavía usa su hash
+  anterior y no consume esta huella.
+- La moneda acepta códigos alfabéticos de tres letras en el DTO, pero ese
+  formato no verifica por sí solo que el código esté asignado en ISO 4217. El
+  DDL actual restringe la persistencia a PEN/USD; una moneda distinta o
+  desconocida requiere resolver esa incompatibilidad en una fase posterior.
+  Un `$` sin más evidencia se conserva como texto y no se interpreta como USD.
+- Precios ausentes permanecen como `None` con estado `NOT_FOUND`, no como cero.
+  La persistencia actual requiere importes para escribir un snapshot; por ello,
+  una oferta Cibertec sin precio todavía no es persistible de forma segura.
+  Resolver su cuarentena/soporte opcional forma parte de la Fase 3.
+- PUCP conserva el docente y el contacto que antes se perdían en el adaptador.
+  Cibertec expresa docentes/contactos como `NOT_COLLECTED`, no como ausencia
+  confirmada. La persistencia actual aún no guarda esos campos y sus estados.
+- No se modificaron ETLEngine, DDL, comandos ni escrituras SQL. La huella
+  canónica no cambia la detección de modificaciones de producción. La
+  verificación fixture-based ejecutó 37 pruebas sin preparar la base de datos.
+
 ## Clasificación de cambios
 
-**Implementables en código sin cambiar el esquema actual:** definir el contrato
-Pydantic completo; adaptar las dos fuentes y verificar que cada campo llegue al
-DTO; normalizar URLs en un componente testeable; hacer que el comando diario
-use `next_run_at`; separar orquestación, extracción y repositorio; añadir
-pruebas con fixtures; definir contratos y borradores SQL de vistas `bi` sin
-ejecutarlos en la base de negocio.
+**Implementables en código sin cambiar el esquema actual:** contrato Pydantic y
+adaptadores PUCP/Cibertec con normalización básica (completados en la Fase 2);
+normalizar URLs en un componente testeable; hacer que el comando diario use
+`next_run_at`; separar orquestación, extracción y repositorio; añadir pruebas
+con fixtures; definir contratos y borradores SQL de vistas `bi` sin ejecutarlos
+en la base de negocio.
 
 **Requieren diseño/migración de PostgreSQL:** versionado temporal completo y
 referencia a `ingestion_log`; soporte persistente para identidad por URL

@@ -1,12 +1,32 @@
-# etl/schemas.py
-import re
-from typing import List, Optional, Literal
+import hashlib
+import json
 from datetime import date, time
 from decimal import Decimal
-from urllib.parse import urlparse
+from enum import StrEnum
+from typing import Literal, Optional
 
 from django.utils.text import slugify
 from pydantic import BaseModel, Field, HttpUrl, model_validator
+
+
+class ObservationStatus(StrEnum):
+    OBSERVED = "OBSERVED"
+    NOT_FOUND = "NOT_FOUND"
+    NOT_COLLECTED = "NOT_COLLECTED"
+    UNKNOWN = "UNKNOWN"
+
+
+class NormalizedModality(StrEnum):
+    VIRTUAL = "VIRTUAL"
+    PRESENTIAL = "PRESENCIAL"
+    HYBRID = "HIBRIDA"
+
+
+class PublicationStatus(StrEnum):
+    PUBLISHED = "PUBLISHED"
+    UNPUBLISHED = "UNPUBLISHED"
+    CANCELLED = "CANCELLED"
+    FINISHED = "FINISHED"
 
 
 class ScheduleItemSchema(BaseModel):
@@ -17,8 +37,23 @@ class ScheduleItemSchema(BaseModel):
     @model_validator(mode="after")
     def check_times(self) -> "ScheduleItemSchema":
         if self.end_time <= self.start_time:
-            raise ValueError(f"end_time ({self.end_time}) debe ser mayor que start_time ({self.start_time})")
+            raise ValueError(
+                f"end_time ({self.end_time}) debe ser mayor que start_time ({self.start_time})"
+            )
         return self
+
+
+class DurationSchema(BaseModel):
+    amount: Decimal = Field(ge=0)
+    unit: Literal["HOUR", "WEEK", "SESSION"]
+    original_text: Optional[str] = None
+
+
+class CategorySchema(BaseModel):
+    source_label: Optional[str] = None
+    normalized_label: Optional[str] = None
+    homologation_code: Optional[str] = None
+    observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
 
 
 class ProfessorSchema(BaseModel):
@@ -32,41 +67,55 @@ class ContactSchema(BaseModel):
     email: Optional[str] = None
 
 
+class CertificateSchema(BaseModel):
+    kind: Literal["CERTIFICATE", "PARTICIPATION"]
+    issuer: Optional[str] = None
+    description: Optional[str] = None
+
+
 class CourseExtractedSchema(BaseModel):
-    # Identificadores y Maestros
+    """Source-specific PUCP extraction contract; not the shared ETL DTO."""
+
     source_code: str = "PUCP"
     external_id: str = Field(..., min_length=1)
     course_url: HttpUrl
     category_name: Optional[str] = None
-    modality_code: Literal["VIRTUAL_SINC", "VIRTUAL_ASINC", "PRESENCIAL", "HIBRIDO"] = "VIRTUAL_SINC"
+    modality_code: Literal[
+        "VIRTUAL_SINC", "VIRTUAL_ASINC", "PRESENCIAL", "HIBRIDO"
+    ] = "VIRTUAL_SINC"
+    modality_raw: Optional[str] = None
 
-    # Datos de la tabla `course`
     name: str = Field(..., min_length=3)
     description: Optional[str] = None
     duration_hours: Optional[Decimal] = Field(None, ge=0)
     has_certificate: bool = False
     has_participation_certificate: bool = False
-
-    # Tablas hijas de `course`
-    content_items: List[str] = Field(default_factory=list)
+    content_items: list[str] = Field(default_factory=list)
     contact: Optional[ContactSchema] = None
+    contact_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    professor: Optional[ProfessorSchema] = None
+    professor_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    certificate_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    participation_certificate_observation: ObservationStatus = (
+        ObservationStatus.NOT_COLLECTED
+    )
+    content_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
 
-    # Datos de `course_offering` y relaciones
     external_offering_code: str
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    schedules: List[ScheduleItemSchema] = Field(default_factory=list)
-    professor: Optional[ProfessorSchema] = None
+    schedules: list[ScheduleItemSchema] = Field(default_factory=list)
 
-    # Datos de `price_snapshot`
-    currency: Literal["PEN", "USD"] = "PEN"
+    currency: Optional[str] = Field(default=None, pattern=r"^[A-Z]{3}$")
+    currency_raw: Optional[str] = None
+    price_observation: ObservationStatus = ObservationStatus.UNKNOWN
     price_amount: Decimal = Field(..., ge=0)
-
-    # Datos extraídos que se guardan en el JSONB `raw_payload` (o se reportan como omitidos)
+    price_raw: Optional[str] = None
+    duration_original: Optional[str] = None
     target_audience_raw: Optional[str] = None
     brochure_url_raw: Optional[str] = None
-    start_date_str: Optional[str] = None  # Formato DD/MM/YYYY solicitado
-    end_date_str: Optional[str] = None    # Formato DD/MM/YYYY solicitado
+    start_date_str: Optional[str] = None
+    end_date_str: Optional[str] = None
     price_details_raw: Optional[str] = None
 
     @model_validator(mode="after")
@@ -94,14 +143,14 @@ class ScrapedDiscountDTO(BaseModel):
 
 class ScrapedPaymentPlanDTO(BaseModel):
     installments: int = Field(ge=1)
-    cards: List[str] = Field(default_factory=list)
+    cards: list[str] = Field(default_factory=list)
     interest_rate: Decimal = Field(default=Decimal("0"), ge=0)
 
 
 class ScrapedPriceTierDTO(BaseModel):
     segment_code: str = Field(min_length=1)
     amount: Decimal = Field(ge=0)
-    currency: Literal["PEN", "USD"] = "PEN"
+    currency: Optional[str] = Field(default=None, pattern=r"^[A-Z]{3}$")
     notes: Optional[str] = None
 
 
@@ -110,19 +159,38 @@ class ScrapedOfferingDTO(BaseModel):
     modality_code: Literal[
         "VIRTUAL_SINC", "VIRTUAL_ASINC", "PRESENCIAL", "HIBRIDO"
     ] = "VIRTUAL_SINC"
+    normalized_modality: Optional[NormalizedModality] = None
+    modality_raw: Optional[str] = None
+    modality_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     start_date: Optional[date] = None
+    start_date_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     end_date: Optional[date] = None
+    end_date_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     duration_hours: Optional[Decimal] = Field(default=None, ge=0)
     duration_weeks: Optional[Decimal] = Field(default=None, ge=0)
     sessions_count: Optional[int] = Field(default=None, ge=0)
-    schedules: List[ScheduleItemSchema] = Field(default_factory=list)
+    duration_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    durations: list[DurationSchema] = Field(default_factory=list)
+    schedules: list[ScheduleItemSchema] = Field(default_factory=list)
+    schedules_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     schedule_text: Optional[str] = None
-    currency: Literal["PEN", "USD"] = "PEN"
-    list_amount: Decimal = Field(ge=0)
-    final_amount: Decimal = Field(ge=0)
-    discounts: List[ScrapedDiscountDTO] = Field(default_factory=list)
-    price_tiers: List[ScrapedPriceTierDTO] = Field(default_factory=list)
-    payment_plans: List[ScrapedPaymentPlanDTO] = Field(default_factory=list)
+    publication_status: Optional[PublicationStatus] = None
+    publication_status_observation: ObservationStatus = (
+        ObservationStatus.NOT_COLLECTED
+    )
+    currency: Optional[str] = Field(default=None, pattern=r"^[A-Z]{3}$")
+    currency_raw: Optional[str] = None
+    currency_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    list_amount: Optional[Decimal] = Field(..., ge=0)
+    final_amount: Optional[Decimal] = Field(..., ge=0)
+    price_observation: ObservationStatus = ObservationStatus.UNKNOWN
+    discounts: list[ScrapedDiscountDTO] = Field(default_factory=list)
+    price_tiers: list[ScrapedPriceTierDTO] = Field(default_factory=list)
+    payment_plans: list[ScrapedPaymentPlanDTO] = Field(default_factory=list)
+    commercial_conditions: list[str] = Field(default_factory=list)
+    commercial_conditions_observation: ObservationStatus = (
+        ObservationStatus.NOT_COLLECTED
+    )
     raw_payload: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -143,20 +211,43 @@ class ScrapedOfferingDTO(BaseModel):
 
 
 class ScrapedCourseDTO(BaseModel):
-    source_code: Literal["PUCP", "CIBERTEC"]
+    """Shared, source-neutral contract consumed by ETLEngine."""
+
+    source_code: str = Field(min_length=1)
     external_id: str = Field(min_length=1)
     course_url: HttpUrl
     category_name: Optional[str] = None
+    category: Optional[CategorySchema] = None
+    category_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     name: str = Field(min_length=3)
     description: Optional[str] = None
     duration_hours: Optional[Decimal] = Field(default=None, ge=0)
+    duration_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    durations: list[DurationSchema] = Field(default_factory=list)
+
+    # Legacy booleans remain for the existing ETLEngine/DDL contract. The
+    # observation fields below distinguish unknown from a verified negative.
     has_certificate: bool = False
     has_participation_certificate: bool = False
-    content_items: List[str] = Field(default_factory=list)
-    prerequisite_items: List[str] = Field(default_factory=list)
-    hardware_requirements: List[str] = Field(default_factory=list)
-    software_requirements: List[str] = Field(default_factory=list)
-    offerings: List[ScrapedOfferingDTO] = Field(default_factory=list)
+    certificate_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    participation_certificate_observation: ObservationStatus = (
+        ObservationStatus.NOT_COLLECTED
+    )
+    certificates: list[CertificateSchema] = Field(default_factory=list)
+
+    content_items: list[str] = Field(default_factory=list)
+    content_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    prerequisite_items: list[str] = Field(default_factory=list)
+    prerequisites_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    hardware_requirements: list[str] = Field(default_factory=list)
+    hardware_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    software_requirements: list[str] = Field(default_factory=list)
+    software_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    professors: list[ProfessorSchema] = Field(default_factory=list)
+    professors_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    contacts: list[ContactSchema] = Field(default_factory=list)
+    contacts_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
+    offerings: list[ScrapedOfferingDTO] = Field(default_factory=list)
     raw_payload: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -165,116 +256,33 @@ class ScrapedCourseDTO(BaseModel):
             raise ValueError("El curso debe incluir al menos una cohorte o una oferta permanente")
         return self
 
+    def canonical_content(self) -> dict:
+        """Return deterministic normalized business content, excluding raw HTML/source payloads."""
+        content = self.model_dump(mode="json", exclude={"raw_payload"})
+        for offering in content["offerings"]:
+            offering.pop("raw_payload", None)
+            offering["schedules"] = sorted(
+                offering["schedules"],
+                key=lambda row: (
+                    row["day_of_week"],
+                    row["start_time"],
+                    row["end_time"],
+                ),
+            )
+        return content
+
+    def canonical_fingerprint(self) -> str:
+        encoded = json.dumps(
+            self.canonical_content(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
 
 def pucp_course_to_dto(data: CourseExtractedSchema) -> ScrapedCourseDTO:
-    """Adapt the established PUCP extractor contract to the shared ETL DTO."""
-    parsed_url = urlparse(str(data.course_url))
-    slug = parsed_url.path.rstrip("/").split("/")[-1] or data.external_id
-    details = data.price_details_raw or ""
+    """Compatibility entry point; the institution adapter owns the mapping."""
+    from etl.adapters import adapt_pucp_course
 
-    def amount(value: str) -> Decimal:
-        normalized = value.replace(" ", "")
-        if "," in normalized and "." in normalized:
-            normalized = normalized.replace(",", "")
-        elif "," in normalized:
-            normalized = normalized.replace(",", ".")
-        return Decimal(normalized)
-
-    regular_match = re.search(
-        r"Tarifa\s+general:\s*S/?\.?\s*([\d.,]+)", details, re.IGNORECASE
-    )
-    tiers: list[ScrapedPriceTierDTO] = []
-    community_match = re.search(
-        r"Comunidad\s+PUCP[^:]*:\s*S/?\.?\s*([\d.,]+)", details, re.IGNORECASE
-    )
-    if community_match:
-        community_amount = amount(community_match.group(1))
-        for code in (
-            "PUCP_PREGRADO", "PUCP_POSGRADO", "PUCP_EGRESADO",
-            "PUCP_DOCENTE", "PUCP_COLABORADOR",
-        ):
-            tiers.append(ScrapedPriceTierDTO(segment_code=code, amount=community_amount))
-    other_university_match = re.search(
-        r"Alumnos?\s+de\s+pregrado\s+otras\s+universidades[^:]*:\s*S/?\.?\s*([\d.,]+)",
-        details,
-        re.IGNORECASE,
-    )
-    if other_university_match:
-        tiers.append(ScrapedPriceTierDTO(
-            segment_code="OTRA_UNIV_PREGRADO",
-            amount=amount(other_university_match.group(1)),
-        ))
-
-    discounts: list[ScrapedDiscountDTO] = []
-    for label, code in (
-        (r"ASOCEGRE|Asociado\s+Hábil", "ASOCEGRE"),
-        (r"Instituciones?\s+Educativas?\s+en\s+convenio", "INSTITUCION_CONVENIO"),
-        (r"empresas?\s+en\s+convenio", "EMPRESA_CONVENIO"),
-    ):
-        match = re.search(
-            rf"(?:{label})[^:]*:\s*([\d.,]+)\s*%",
-            details,
-            re.IGNORECASE,
-        )
-        if match:
-            discounts.append(ScrapedDiscountDTO(
-                kind="PERCENT",
-                value=amount(match.group(1)),
-                segment_code=code,
-                description=match.group(0).strip(),
-            ))
-
-    payment_plans: list[ScrapedPaymentPlanDTO] = []
-    for match in re.finditer(
-        r"Tarjetas?\s+de\s+crédito\s+([^:]+):\s*(.*?)(?=Tarjetas?\s+de\s+crédito|$)",
-        details,
-        re.IGNORECASE,
-    ):
-        card_name, terms = match.groups()
-        counts = re.search(r"((?:\d+\s*(?:;|,|y)?\s*)+)\s*cuotas?", terms, re.I)
-        if not counts:
-            single_count = re.search(r"hasta\s+(\d+)\s+cuotas?", terms, re.I)
-            installments = [int(single_count.group(1))] if single_count else []
-        else:
-            installments = [int(value) for value in re.findall(r"\d+", counts.group(1))]
-        for count in dict.fromkeys(installments):
-            payment_plans.append(ScrapedPaymentPlanDTO(
-                installments=count, cards=[card_name.strip()]
-            ))
-
-    return ScrapedCourseDTO(
-        source_code="PUCP",
-        external_id=data.external_id,
-        course_url=data.course_url,
-        category_name=data.category_name,
-        name=data.name,
-        description=data.description,
-        duration_hours=data.duration_hours,
-        has_certificate=data.has_certificate,
-        has_participation_certificate=data.has_participation_certificate,
-        content_items=data.content_items,
-        offerings=[
-            ScrapedOfferingDTO(
-                external_code=data.external_offering_code or None,
-                modality_code=data.modality_code,
-                start_date=data.start_date,
-                end_date=data.end_date,
-                duration_hours=data.duration_hours,
-                schedules=data.schedules,
-                currency=data.currency,
-                list_amount=amount(regular_match.group(1)) if regular_match else data.price_amount,
-                final_amount=data.price_amount,
-                discounts=discounts,
-                price_tiers=tiers,
-                payment_plans=payment_plans,
-                raw_payload={
-                    "brochure_url": data.brochure_url_raw,
-                    "target_audience": data.target_audience_raw,
-                    "start_date_text": data.start_date_str,
-                    "end_date_text": data.end_date_str,
-                    "price_details": details,
-                },
-            )
-        ],
-        raw_payload={"slug": slug},
-    )
+    return adapt_pucp_course(data)

@@ -18,10 +18,12 @@ from django.utils.text import slugify
 from etl.extractors.base import BaseExtractor
 from etl.schemas import (
     CourseExtractedSchema,
+    ObservationStatus,
     ScheduleItemSchema,
     ProfessorSchema,
     ContactSchema,
 )
+from etl.normalization import normalize_amount, normalize_currency
 
 
 MESES_ES = {
@@ -139,25 +141,27 @@ class PucpExtractor(BaseExtractor):
         if not start_match or not end_match:
             return None, None, None, None
 
-        d_ini, m_ini_str, _ = start_match.groups()
-        d_fin, m_fin_str, _ = end_match.groups()
+        d_ini, m_ini_str, explicit_start_year = start_match.groups()
+        d_fin, m_fin_str, explicit_end_year = end_match.groups()
 
         m_ini = MESES_ES.get(m_ini_str)
         m_fin = MESES_ES.get(m_fin_str)
         if not m_ini or not m_fin:
             return None, None, None, None
 
-        # Regla 1: Año base = año actual. Si ambos meses son menores al mes actual, sumar 1 año a ambos.
-        base_year = ref.year
-        if m_ini < ref.month and m_fin < ref.month:
-            y_ini = base_year + 1
-            y_fin = base_year + 1
-        else:
-            y_ini = base_year
-            y_fin = base_year
+        # Explicit source years take precedence; infer only missing years.
+        y_ini = int(explicit_start_year) if explicit_start_year else ref.year
+        y_fin = int(explicit_end_year) if explicit_end_year else y_ini
+        if not explicit_start_year and not explicit_end_year and m_ini < ref.month and m_fin < ref.month:
+            y_ini += 1
+            y_fin = y_ini
+        elif not explicit_start_year and m_ini < ref.month:
+            y_ini += 1
+            if not explicit_end_year:
+                y_fin = y_ini
 
         # Regla 2: Si el mes final es menor al mes de inicio (cruce dic -> ene), el fin es el año siguiente.
-        if m_fin < m_ini:
+        if m_fin < m_ini and not explicit_end_year:
             y_fin = y_ini + 1
 
         start_dt = date(y_ini, m_ini, int(d_ini))
@@ -177,14 +181,13 @@ class PucpExtractor(BaseExtractor):
         return Decimal(match.group(1)) if match else None
 
     @staticmethod
-    def _parse_price(el6: str) -> Tuple[str, Decimal]:
-        """Extrae moneda ('PEN'/'USD') y monto de 'Inversión: S/ 520'."""
-        currency = "USD" if ("$" in el6 or "usd" in el6.lower()) else "PEN"
-        cleaned = el6.replace(",", "")
-        match = re.search(r"(\d+(?:\.\d+)?)", cleaned)
-        if not match:
+    def _parse_price(el6: str) -> Tuple[Optional[str], Decimal]:
+        """Parse amount and only return a currency when the source identifies it."""
+        currency = normalize_currency(el6)
+        amount = normalize_amount(el6)
+        if amount is None:
             raise ValueError(f"No se pudo extraer monto numérico de precio: '{el6}'")
-        return currency, Decimal(match.group(1))
+        return currency, amount
 
     @staticmethod
     def _itemize_syllabus(el10_elem) -> List[str]:
@@ -318,6 +321,22 @@ class PucpExtractor(BaseExtractor):
             modality_code = "VIRTUAL_ASINC"
         elif brochure_url and "presencial" in brochure_url.lower():
             modality_code = "PRESENCIAL"
+        modality_raw = next(
+            (
+                term
+                for term in ("híbrido", "hibrido", "presencial", "virtual", "asincrónico", "asincronico")
+                if term in " ".join(elements).lower()
+            ),
+            None,
+        )
+        if modality_raw is None and brochure_url:
+            modality_raw = (
+                "presencial"
+                if "presencial" in brochure_url.lower()
+                else "virtual asincrónico"
+                if "asincrono" in brochure_url.lower()
+                else None
+            )
 
         # Elemento 13: Horario
         schedules = self._parse_schedule(get_el(13))
@@ -351,20 +370,42 @@ class PucpExtractor(BaseExtractor):
             course_url=url,
             category_name=category_name,
             modality_code=modality_code,
+            modality_raw=modality_raw,
             name=clean_name,
             description=description,
             duration_hours=duration_hours,
             has_certificate=has_cert,
             has_participation_certificate=has_part_cert,
             content_items=content_items,
+            content_observation=(
+                ObservationStatus.OBSERVED if content_items else ObservationStatus.NOT_FOUND
+            ),
             contact=contact,
+            contact_observation=(
+                ObservationStatus.OBSERVED if contact else ObservationStatus.NOT_FOUND
+            ),
+            professor=professor,
+            professor_observation=(
+                ObservationStatus.OBSERVED if professor else ObservationStatus.NOT_FOUND
+            ),
+            certificate_observation=(
+                ObservationStatus.OBSERVED if get_el(16) else ObservationStatus.NOT_COLLECTED
+            ),
+            participation_certificate_observation=(
+                ObservationStatus.OBSERVED if get_el(16) else ObservationStatus.NOT_COLLECTED
+            ),
             external_offering_code=offering_code,
             start_date=start_dt,
             end_date=end_dt,
             schedules=schedules,
-            professor=professor,
             currency=currency,
+            currency_raw=get_el(6),
+            price_observation=(
+                ObservationStatus.OBSERVED if get_el(6) else ObservationStatus.NOT_FOUND
+            ),
             price_amount=price_amount,
+            price_raw=get_el(6),
+            duration_original=get_el(5) or None,
             target_audience_raw=target_audience,
             brochure_url_raw=brochure_url,
             start_date_str=start_str,

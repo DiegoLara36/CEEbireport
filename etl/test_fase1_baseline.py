@@ -372,6 +372,7 @@ class EtlEnginePureLogicBaselineTests(SimpleTestCase):
             "PEN",
         )
         offering = ScrapedOfferingDTO(
+            currency="PEN",
             list_amount=Decimal("520"),
             final_amount=Decimal("490"),
         )

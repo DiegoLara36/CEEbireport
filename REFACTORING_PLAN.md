@@ -1,26 +1,27 @@
 # CEEBI: plan incremental de refactorización
 
-Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. Es una hoja de
-ruta: **no se ejecutaron cambios de código ni de PostgreSQL al redactarla**.
-Las rutas de archivos son las actuales o propuestas.
+Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. La Fase 1
+(línea base) y la Fase 2 (contrato común y normalización) están implementadas
+en la rama actual. Las fases restantes son propuestas; no se han aplicado
+cambios de PostgreSQL.
 
 ## Orden y dependencias
 
 ```text
-Fase 0 Línea base
-  → Fase 1 Contrato y mapeo común
-  → Fase 2 Persistencia encapsulada e historial
-  → Fase 3 Identidad, concurrencia y ejecución confiable
-  → Fase 4 Esquema y vistas BI
-  → Fase 5 ORM gradual (solo si aporta valor)
-  → Fase 6 Metabase embedding (tras validar instancia/licencia)
+Fase 1 Línea base (completada)
+  → Fase 2 Contrato común y normalización (completada)
+  → Fase 3 Persistencia encapsulada e historial temporal
+  → Fase 4 Identidad, concurrencia y ejecución confiable
+  → Fase 5 Esquema y vistas BI
+  → Fase 6 ORM gradual (solo si aporta valor)
+  → Fase 7 Metabase embedding (tras validar instancia/licencia)
 ```
 
-La fase 4 puede prepararse en paralelo con la fase 3 una vez fijados los
-contratos de datos y la granularidad de las tablas versionadas. La fase 5 no es
+La Fase 5 puede prepararse en paralelo con la Fase 4 una vez fijados los
+contratos de datos y la granularidad de las tablas versionadas. La Fase 6 no es
 prerrequisito para Metabase: Metabase leerá `bi`, no el ORM.
 
-## Fase 0 — Línea base funcional
+## Fase 1 — Línea base funcional (completada)
 
 **Objetivo:** establecer comportamiento y cobertura de PUCP y Cibertec antes de
 refactorizar.
@@ -43,41 +44,51 @@ fixtures que no representen cambios de estructura web.
 horarios, DTO y reglas de identidad; tests del resultado actual del ETL sobre
 PostgreSQL de pruebas o transacciones aisladas.
 
-**Termina cuando:** la matriz campo-origen → extractor → DTO → persistencia está
-documentada, y las pruebas reproducen las capacidades actuales de ambas
-fuentes sin depender de páginas en vivo.
+**Resultado:** `FASE_1_LINEA_BASE.md`, fixtures HTML de ambas fuentes y pruebas
+offline establecen el comportamiento previo a la refactorización. El informe
+documenta el recorrido de campos, las brechas de persistencia y el riesgo del
+hash actual de `ETLEngine`.
 
-## Fase 1 — DTO común, adaptadores y normalización
+## Fase 2 — DTO común, adaptadores y normalización (completada)
 
 **Objetivo:** garantizar un contrato Pydantic consistente para ambas
 instituciones y hacer explícita la normalización.
 
-**Archivos/componentes:** `etl/schemas.py`, `etl/extractors/base.py`,
-`etl/extractors/pucp.py`, `etl/extractors/cibertec.py`; propuestos
-`etl/normalization/` y módulos de esquema común/fuente.
+**Archivos/componentes:** `etl/schemas.py`, `etl/adapters.py`,
+`etl/normalization.py`, `etl/extractors/pucp.py`,
+`etl/extractors/cibertec.py` y `etl/test_phase2_normalization.py`.
 
-**Acciones:** añadir al DTO común los campos analíticos acordados (docentes,
-contactos, certificados y constancias además de los ya incluidos); pasar los
-datos desde cada extractor y desde `pucp_course_to_dto()`; aislar campos
-propios de fuente; documentar formatos normalizados y conservar raw payload
-relevante. No convertir esquemas Pydantic en modelos Django.
+**Resultado:** contratos diferenciados de extracción y DTO común con campos
+analíticos, estados de observación y esquemas auxiliares. Los adaptadores
+normalizan categoría, modalidad, duración y monedas cuando existe evidencia;
+conservan códigos legados de modalidad y payloads específicos. Se añade una
+huella canónica determinista que todavía no usa el motor.
 
-**Implementable sin cambio de PostgreSQL:** ampliar Pydantic y los mapeos,
-pruebas de campos, normalización, URL canónica y adaptadores.
+**Implementable sin cambio de PostgreSQL:** completado para contratos,
+adaptadores y normalizadores. No se convirtieron esquemas Pydantic en modelos
+Django.
 
-**Dependencias:** fase 0.
+**Dependencias:** Fase 1.
 
 **Riesgos:** defaults que oculten campos no mapeados; modificar el significado
 de precio, duración o modalidad; perder datos que ya están en `raw_payload`.
 
-**Pruebas necesarias:** datos obligatorios/opcionales, estructuras anidadas,
-DTO completo por fuente; asserts de que profesor/contacto/certificados y
-atributos propios pasan hasta la entrada de persistencia.
+**Pruebas ejecutadas:** fixtures PUCP/Cibertec, campos anidados y opcionales,
+normalización, equivalencia semántica, moneda ambigua y determinismo de huella.
+La Fase 1 se mantiene y su prueba de snapshot ahora especifica PEN
+explícitamente, sin depender de un default de moneda.
 
-**Termina cuando:** ambos extractores producen el DTO común esperado y el
-contrato distingue ausente, desconocido y explícitamente vacío.
+**Resultado:** ambos extractores producen DTOs válidos; docentes/contactos de
+PUCP llegan al DTO, y Cibertec mantiene esos datos como `NOT_COLLECTED`. El DDL
+y la persistencia permanecen intactos.
 
-## Fase 2 — Persistencia/repositorio e historial temporal
+**Límites conocidos:** la huella común todavía no sustituye los hashes del
+motor; la base sigue admitiendo solo PEN/USD; y el ETL/DDL vigente necesita
+importes para persistir una oferta. Los datos de moneda/precio desconocidos
+quedan identificados, pero su cuarentena o persistencia opcional se resolverá
+en la Fase 3.
+
+## Fase 3 — Persistencia/repositorio e historial temporal
 
 **Objetivo:** desacoplar la orquestación de SQL y preservar versiones de negocio
 con la ejecución que las detectó.
@@ -90,7 +101,10 @@ aditivas para `DDL.txt` o un directorio de migraciones SQL versionadas.
 preservar escrituras idempotentes y transacciones actuales; añadir versiones
 temporales para cursos/ofertas y atributos acordados, con vínculo a
 `ingestion_log`; mantener el cierre de snapshots de precios existente.
-No crear versiones cuando el hash canónico no cambie.
+Adoptar la huella canónica solo después de comprobar el mapeo completo y
+compatibilidad; no crear versiones cuando no se detecten cambios. Definir cómo
+se ponen en cuarentena ofertas con precios o monedas que el DDL no puede
+persistir, sin sustituir el desconocido por cero o PEN.
 
 **Implementable en código sin cambio de DB:** extraer repositorios conservando
 las tablas y SQL actuales, con pruebas de contrato.
@@ -98,7 +112,7 @@ las tablas y SQL actuales, con pruebas de contrato.
 **Requiere cambio de PostgreSQL:** tablas/columnas/constraints de historial,
 FK a ejecución, y cualquier campo no persistido que se acuerde conservar.
 
-**Dependencias:** fase 1 y diseño de granularidad temporal.
+**Dependencias:** Fases 1 y 2, además del diseño de granularidad temporal.
 
 **Riesgos:** duplicar eventos entre `change_log` e historial; diferencias
 concurrentes; registros sin historial previo; tratar ausencia por extracción
@@ -107,12 +121,13 @@ incompleta como eliminación real.
 **Pruebas necesarias:** no-op no versiona; cambios de cada campo relevante
 versionan una vez; toda versión referencia la ingesta correcta; transacción
 rollback; ejecución repetida es idempotente; curso ausente en captura parcial
-no se desactiva.
+no se desactiva; datos monetarios desconocidos no producen snapshots falsos y
+quedan visibles como errores/cuarentena.
 
 **Termina cuando:** se pueden consultar estados actuales y pasados, y ninguna
 versión normalizada se elimina automáticamente.
 
-## Fase 3 — Identidad y operación confiable
+## Fase 4 — Identidad y operación confiable
 
 **Objetivo:** asegurar claves estables, capturas por fuente sin solapamiento y
 recuperación visible de procesos interrumpidos.
@@ -135,7 +150,7 @@ reconciliación, elección de fuentes por `next_run_at` y comandos existentes.
 persistencia de reconciliación, lock durable o metadata de ejecución, estados
 adicionales si se elige no reutilizar `PARTIAL`.
 
-**Dependencias:** identidad aprobada y fase 2; pruebas de concurrencia antes de
+**Dependencias:** identidad aprobada y Fase 3; pruebas de concurrencia antes de
 habilitar la tarea automática.
 
 **Riesgos:** URL con parámetros/tracking, cambios legítimos de URL, doble
@@ -148,7 +163,7 @@ política; fallo/interrupción queda detectable; reintento no duplica filas.
 **Termina cuando:** captura diaria revisa fechas, selección manual sigue
 funcionando y la exclusión/recovery está verificada en PostgreSQL de prueba.
 
-## Fase 4 — Vistas `bi` y usuario de lectura
+## Fase 5 — Vistas `bi` y usuario de lectura
 
 **Objetivo:** habilitar consultas analíticas aisladas sin mover las tablas
 operativas.
@@ -168,7 +183,7 @@ versionados para el esquema, vistas y permisos.
 
 **Requiere cambio de PostgreSQL:** desplegar `CREATE SCHEMA`, vistas, grants y
 revocaciones en la instancia. Las vistas históricas completas dependen de la
-fase 2.
+Fase 3.
 
 **Dependencias:** contrato de cada vista y esquema de historial definido; la
 comparación depende además de homologaciones administrables.
@@ -185,7 +200,7 @@ operativas para el usuario BI.
 **Termina cuando:** Metabase puede leer las vistas requeridas y su rol no puede
 modificar ni consultar directamente datos operativos no autorizados.
 
-## Fase 5 — ORM gradual (condicional)
+## Fase 6 — ORM gradual (condicional)
 
 **Objetivo:** usar Django ORM donde reduzca complejidad de CRUD y relaciones,
 sin desplazar SQL ETL ni cambiar datos por principio.
@@ -220,7 +235,7 @@ las claves y el historial permanezcan idénticos.
 **Termina cuando:** el CRUD escogido usa ORM con ventaja demostrada, sin que
 migrations modifique tablas no transferidas ni cambie datos/IDs.
 
-## Fase 6 — Integración Metabase
+## Fase 7 — Integración Metabase
 
 **Objetivo:** mostrar dashboards desde Django con Guest Embedding firmado por
 servidor, sin introducir el secreto en el cliente.
@@ -243,7 +258,7 @@ configuración de secretos una vez validada la instancia.
 metadatos separada, usuario de PostgreSQL de solo lectura sobre `bi`, variables
 secretas y política de despliegue.
 
-**Dependencias:** fase 4 desplegada y aceptada; verificación de capacidades y
+**Dependencias:** Fase 5 desplegada y aceptada; verificación de capacidades y
 licencia.
 
 **Riesgos:** filtrar JWT/secreto, filtros manipulables, permisos de lectura más
@@ -263,7 +278,7 @@ configurables, no como una limpieza general en la primera refactorización:
 
 | Clase de dato | Acción planificada | Dependencia |
 |---|---|---|
-| Versiones de curso/oferta y precios | Sin borrado automático | Fase 2 |
+| Versiones de curso/oferta y precios | Sin borrado automático | Fase 3 |
 | `ingestion_log` | Política configurable de 24 meses | Configuración y tarea de mantenimiento probada |
 | HTML y payloads crudos (`raw_page`, `raw_payload`) | 90 días; revisar el borrado actual de `_purge_raw_pages()` y separar payload crudo de valores normalizados de snapshots | Parámetro aplicado de forma consistente sin borrar el historial normalizado |
 | Cuarentena resuelta | 90 días desde `resolved_at` | Añadir/definir campo y flujo de resolución |
