@@ -9,6 +9,8 @@ from etl.persistence.repositories import (
     CourseRepository,
     OfferingRepository,
     PriceRepository,
+    _fingerprint,
+    _offering_fingerprint,
     _preserve_unobserved,
 )
 from etl.schemas import (
@@ -79,6 +81,70 @@ class PersistenceContractTests(SimpleTestCase):
         self.assertIsNone(attributes["duration_hours"])
         self.assertEqual(attributes["schedules"], [])
 
+    def test_legacy_offering_values_survive_first_version_upgrade(self):
+        cursor = Mock()
+        cursor.fetchone.side_effect = [
+            None,
+            (
+                "2026-11-14",
+                date(2026, 11, 14),
+                None,
+                Decimal("30"),
+                None,
+                None,
+                "ACTIVE",
+                "VIRTUAL_SINC",
+            ),
+        ]
+        cursor.fetchall.return_value = []
+
+        previous = OfferingRepository._current_version(cursor, 7)
+        current = OfferingRepository._attributes(
+            ScrapedOfferingDTO(
+                start_date_observation=ObservationStatus.NOT_COLLECTED,
+                duration_observation=ObservationStatus.NOT_COLLECTED,
+                list_amount=None,
+                final_amount=None,
+            )
+        )
+        merged = _preserve_unobserved(
+            current,
+            previous,
+            {
+                "start_date": "start_date_observation",
+                "duration_hours": "duration_observation",
+                "modality_code": "modality_observation",
+            },
+        )
+
+        self.assertEqual(merged["start_date"], date(2026, 11, 14))
+        self.assertEqual(merged["duration_hours"], Decimal("30"))
+        self.assertEqual(merged["modality_code"], "VIRTUAL_SINC")
+
+    def test_legacy_course_duration_survives_first_version_upgrade(self):
+        cursor = Mock()
+        cursor.fetchone.side_effect = [
+            None,
+            (
+                2,
+                5,
+                "Tecnología",
+                Decimal("24"),
+                None,
+                None,
+                False,
+                False,
+                "ACTIVE",
+            ),
+        ]
+        cursor.fetchall.return_value = []
+
+        previous = CourseRepository._current_version(cursor, 8)
+
+        self.assertEqual(previous["duration_hours"], Decimal("24"))
+        self.assertEqual(previous["duration_observation"], "OBSERVED")
+        self.assertEqual(previous["category_name"], "Tecnología")
+
     def test_unobserved_fields_reuse_last_known_values(self):
         incoming = {
             "start_date": None,
@@ -106,6 +172,28 @@ class PersistenceContractTests(SimpleTestCase):
         self.assertEqual(merged["duration_hours"], "30")
         self.assertEqual(merged["start_date_observation"], "OBSERVED")
 
+    def test_fingerprints_ignore_cosmetic_text_and_decimal_scale(self):
+        first = ScrapedOfferingDTO(
+            list_amount=Decimal("100.00"),
+            final_amount=Decimal("90.00"),
+            modality_raw="Virtual",
+            schedule_text="Lunes 19:00-21:00",
+        )
+        second = first.model_copy(deep=True)
+        second.list_amount = Decimal("100")
+        second.final_amount = Decimal("90")
+        second.modality_raw = "VIRTUAL"
+        second.schedule_text = "Lunes de 7 p. m. a 9 p. m."
+
+        self.assertEqual(
+            _offering_fingerprint(OfferingRepository._attributes(first)),
+            _offering_fingerprint(OfferingRepository._attributes(second)),
+        )
+        self.assertEqual(
+            _fingerprint({"amount": "100.00"}),
+            _fingerprint({"amount": "100"}),
+        )
+
     def test_missing_price_records_observation_without_creating_price_snapshot(self):
         cursor = Mock()
         cursor.fetchone.return_value = None
@@ -124,6 +212,9 @@ class PersistenceContractTests(SimpleTestCase):
             any("INSERT INTO offering_price_observation" in sql for sql in statements)
         )
         self.assertFalse(any("INSERT INTO price_snapshot" in sql for sql in statements))
+        self.assertTrue(
+            any("UPDATE price_snapshot" in sql for sql in statements)
+        )
 
     def test_unsupported_currency_is_observed_but_not_saved_as_supported_price(self):
         cursor = Mock()
@@ -144,3 +235,6 @@ class PersistenceContractTests(SimpleTestCase):
             any("INSERT INTO offering_price_observation" in sql for sql in statements)
         )
         self.assertFalse(any("INSERT INTO price_snapshot" in sql for sql in statements))
+        self.assertTrue(
+            any("UPDATE price_snapshot" in sql for sql in statements)
+        )

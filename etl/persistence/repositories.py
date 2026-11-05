@@ -2,7 +2,7 @@ import hashlib
 import json
 import logging
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from django.utils import timezone
@@ -25,11 +25,58 @@ AUTHORITATIVE_STATUSES = {
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+    return json.dumps(
+        _canonical_value(value), ensure_ascii=False, default=str, sort_keys=True
+    )
+
+
+def _canonical_value(value: Any, key: str | None = None) -> Any:
+    decimal_fields = {
+        "amount",
+        "duration_hours",
+        "duration_weeks",
+        "list_amount",
+        "final_amount",
+        "value",
+        "interest_rate",
+        "installment_amount",
+        "total_amount",
+    }
+    if isinstance(value, Decimal):
+        return format(value.normalize(), "f")
+    if isinstance(value, dict):
+        return {field: _canonical_value(item, field) for field, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    if key in decimal_fields and isinstance(value, str):
+        try:
+            return format(Decimal(value).normalize(), "f")
+        except (InvalidOperation, ValueError):
+            return value
+    return value
 
 
 def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _course_fingerprint(attributes: dict, canonical_url: str) -> str:
+    content = {
+        key: value
+        for key, value in attributes.items()
+        if key not in {"raw_payload", "course_url"}
+    }
+    content["canonical_url"] = canonical_url
+    return _fingerprint(content)
+
+
+def _offering_fingerprint(attributes: dict) -> str:
+    content = {
+        key: value
+        for key, value in attributes.items()
+        if key not in {"schedule_text", "modality_raw"}
+    }
+    return _fingerprint(content)
 
 
 def _dump_model(model) -> dict:
@@ -199,6 +246,9 @@ class IngestionRepository:
                 "UPDATE course_offering SET state = 'FINISHED' WHERE id = %s;",
                 (offering_id,),
             )
+            IngestionRepository._version_offering_state(
+                cursor, ingestion_id, offering_id, "FINISHED"
+            )
             self._change_log(
                 cursor, ingestion_id, "course_offering", offering_id, "REMOVED",
                 {"state": {"old": "ACTIVE", "new": "FINISHED"}},
@@ -216,10 +266,86 @@ class IngestionRepository:
                 "UPDATE course SET state = 'INACTIVE' WHERE id = %s;",
                 (course_id,),
             )
+            IngestionRepository._version_course_state(
+                cursor, ingestion_id, course_id, "INACTIVE"
+            )
             self._change_log(
                 cursor, ingestion_id, "course", course_id, "REMOVED",
                 {"state": {"old": "ACTIVE", "new": "INACTIVE"}},
             )
+
+    @staticmethod
+    def _version_offering_state(cursor, ingestion_id, offering_id, state):
+        cursor.execute(
+            """
+            SELECT attributes FROM course_offering_version
+             WHERE offering_id = %s AND valid_to IS NULL
+             FOR UPDATE;
+            """,
+            (offering_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return
+        attributes = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        attributes["state"] = state
+        fingerprint = _offering_fingerprint(attributes)
+        cursor.execute(
+            """
+            UPDATE course_offering_version
+               SET valid_to = GREATEST(clock_timestamp(), valid_from + interval '1 microsecond')
+             WHERE offering_id = %s AND valid_to IS NULL;
+            """,
+            (offering_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO course_offering_version
+                (offering_id, ingestion_id, ingestion_id_original, fingerprint,
+                 attributes, valid_from)
+            VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp());
+            """,
+            (offering_id, ingestion_id, ingestion_id, fingerprint, _json(attributes)),
+        )
+
+    @staticmethod
+    def _version_course_state(cursor, ingestion_id, course_id, state):
+        cursor.execute(
+            """
+            SELECT attributes FROM course_version
+             WHERE course_id = %s AND valid_to IS NULL
+             FOR UPDATE;
+            """,
+            (course_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return
+        attributes = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        attributes["state"] = state
+        cursor.execute(
+            "SELECT canonical_url FROM course WHERE id = %s;",
+            (course_id,),
+        )
+        canonical_url = cursor.fetchone()[0]
+        fingerprint = _course_fingerprint(attributes, canonical_url)
+        cursor.execute(
+            """
+            UPDATE course_version
+               SET valid_to = GREATEST(clock_timestamp(), valid_from + interval '1 microsecond')
+             WHERE course_id = %s AND valid_to IS NULL;
+            """,
+            (course_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO course_version
+                (course_id, ingestion_id, ingestion_id_original, fingerprint,
+                 attributes, valid_from)
+            VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp());
+            """,
+            (course_id, ingestion_id, ingestion_id, fingerprint, _json(attributes)),
+        )
 
     @staticmethod
     def _change_log(cursor, ingestion_id, entity_type, entity_id, action, diff) -> None:
@@ -247,6 +373,21 @@ class PriceRepository:
             )
 
         self._persist_observation(cursor, ingestion_id, offering_id, offering)
+        if offering.price_status in {
+            PriceStatus.NOT_PUBLISHED,
+            PriceStatus.CURRENCY_UNIDENTIFIED,
+            PriceStatus.CURRENCY_UNSUPPORTED,
+        }:
+            cursor.execute(
+                """
+                UPDATE price_snapshot
+                   SET valid_to = GREATEST(
+                       clock_timestamp(), valid_from + interval '1 microsecond'
+                   )
+                 WHERE offering_id = %s AND valid_to IS NULL;
+                """,
+                (offering_id,),
+            )
         self._persist_tiers(cursor, ingestion_id, offering_id, offering)
         self._persist_payment_plans(
             cursor, ingestion_id, offering_id, offering, snapshot_id
@@ -639,12 +780,11 @@ class OfferingRepository:
                 "publication_status": "publication_status_observation",
             },
         )
-        if (
-            existing
-            and attributes.get("modality_observation") not in AUTHORITATIVE_STATUSES
-        ):
+        if attributes.get("modality_observation") in AUTHORITATIVE_STATUSES:
+            modality_id = self._modality_id(cursor, attributes["modality_code"])
+        elif existing:
             modality_id = existing[3]
-        fingerprint = _fingerprint(attributes)
+        fingerprint = _offering_fingerprint(attributes)
         changed = not existing or existing[1] != fingerprint or existing[2] != "ACTIVE"
         if existing:
             self._touch_or_update(cursor, offering_id, attributes, modality_id, fingerprint, changed)
@@ -760,11 +900,15 @@ class OfferingRepository:
                 professor_id = cursor.fetchone()[0]
             cursor.execute(
                 """
-                INSERT INTO professor_source_link (professor_id, source_id)
-                VALUES (%s, %s)
-                ON CONFLICT (professor_id, source_id) DO NOTHING;
+                INSERT INTO professor_source_link
+                    (professor_id, source_id, specialty)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (professor_id, source_id)
+                DO UPDATE SET specialty = COALESCE(
+                    EXCLUDED.specialty, professor_source_link.specialty
+                );
                 """,
-                (professor_id, source_id),
+                (professor_id, source_id, professor.get("specialty")),
             )
             cursor.execute(
                 """
@@ -784,6 +928,7 @@ class OfferingRepository:
     @staticmethod
     def _attributes(offering):
         attrs = _dump_model(offering)
+        attrs["state"] = "ACTIVE"
         for key in (
             "list_amount",
             "final_amount",
@@ -884,7 +1029,79 @@ class OfferingRepository:
         )
         row = cursor.fetchone()
         if not row:
-            return None
+            cursor.execute(
+                """
+                SELECT o.external_code, o.start_date, o.end_date,
+                       o.duration_hours, o.duration_weeks, o.sessions_count,
+                       o.state, m.code
+                  FROM course_offering o
+                  LEFT JOIN modality m ON m.id = o.modality_id
+                 WHERE o.id = %s;
+                """,
+                (offering_id,),
+            )
+            legacy = cursor.fetchone()
+            if not legacy:
+                return None
+            external_code, start, end, hours, weeks, sessions, state, modality = legacy
+            cursor.execute(
+                """
+                SELECT day_of_week, start_time, end_time
+                  FROM offering_schedule
+                 WHERE offering_id = %s
+                 ORDER BY day_of_week, start_time, end_time;
+                """,
+                (offering_id,),
+            )
+            schedules = [
+                {
+                    "day_of_week": day,
+                    "start_time": start.isoformat(),
+                    "end_time": finish.isoformat(),
+                }
+                for day, start, finish in cursor.fetchall()
+            ]
+            return {
+                "external_code": external_code,
+                "start_date": start,
+                "start_date_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if start
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "end_date": end,
+                "end_date_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if end
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "duration_hours": hours,
+                "duration_weeks": weeks,
+                "sessions_count": sessions,
+                "duration_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if any(value is not None for value in (hours, weeks, sessions))
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "durations": [],
+                "modality_code": modality,
+                "normalized_modality": None,
+                "modality_raw": None,
+                "modality_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if modality
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "schedules": schedules,
+                "schedules_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if schedules
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "publication_status": None,
+                "publication_status_observation": ObservationStatus.NOT_COLLECTED.value,
+                "state": state,
+            }
         value = row[0]
         return json.loads(value) if isinstance(value, str) else value
 
@@ -921,8 +1138,31 @@ class OfferingRepository:
     def _synchronize_schedules(cursor, offering_id, attributes, ingestion_id):
         if attributes.get("schedules_observation") not in AUTHORITATIVE_STATUSES:
             return
+        expected = sorted(
+            (
+                schedule["day_of_week"],
+                schedule["start_time"],
+                schedule["end_time"],
+            )
+            for schedule in attributes.get("schedules", [])
+        )
+        cursor.execute(
+            """
+            SELECT day_of_week, start_time, end_time
+              FROM offering_schedule
+             WHERE offering_id = %s
+             ORDER BY day_of_week, start_time, end_time;
+            """,
+            (offering_id,),
+        )
+        current = [
+            (day, start.isoformat(), end.isoformat())
+            for day, start, end in cursor.fetchall()
+        ]
+        if current == expected:
+            return
         cursor.execute("DELETE FROM offering_schedule WHERE offering_id = %s;", (offering_id,))
-        for schedule in attributes.get("schedules", []):
+        for day, start, end in expected:
             cursor.execute(
                 """
                 INSERT INTO offering_schedule (offering_id, day_of_week, start_time, end_time)
@@ -930,9 +1170,9 @@ class OfferingRepository:
                 """,
                 (
                     offering_id,
-                    schedule["day_of_week"],
-                    schedule["start_time"],
-                    schedule["end_time"],
+                    day,
+                    start,
+                    end,
                 ),
             )
 
@@ -971,25 +1211,30 @@ class OfferingRepository:
         if current:
             previous = json.loads(current[1]) if isinstance(current[1], str) else current[1]
         payload = {
-            "discounts": [
-                _dump_model(item)
-                for item in offering.discounts
-            ],
+            "discounts": sorted(
+                (_dump_model(item) for item in offering.discounts), key=_json
+            ),
             "discounts_observation": offering.discounts_observation.value,
-            "commercial_conditions": offering.commercial_conditions,
+            "commercial_conditions": sorted(offering.commercial_conditions),
             "commercial_conditions_observation": (
                 offering.commercial_conditions_observation.value
             ),
             "price_tiers_observation": offering.price_tiers_observation.value,
             "payment_plans_observation": offering.payment_plans_observation.value,
             "price_snapshot_id": snapshot_id,
-            "unpersisted_price_tiers": [
-                _dump_model(tier)
-                for tier in offering.price_tiers
-                if tier.currency not in SUPPORTED_CURRENCIES
-            ],
+            "unpersisted_price_tiers": sorted(
+                (
+                    _dump_model(tier)
+                    for tier in offering.price_tiers
+                    if tier.currency not in SUPPORTED_CURRENCIES
+                ),
+                key=_json,
+            ),
             "unpersisted_payment_plans": (
-                [_dump_model(plan) for plan in offering.payment_plans]
+                sorted(
+                    (_dump_model(plan) for plan in offering.payment_plans),
+                    key=_json,
+                )
                 if (
                     snapshot_id is None
                     or offering.final_amount is None
@@ -1010,6 +1255,9 @@ class OfferingRepository:
                 and previous
             ):
                 payload[field] = previous.get(field, payload[field])
+                payload[status_field] = previous.get(
+                    status_field, payload[status_field]
+                )
         cursor.execute(
             """
             SELECT segment_id, amount, currency, notes
@@ -1107,19 +1355,27 @@ class CourseRepository:
         canonical_url = canonicalize_course_url(str(dto.course_url))
         cursor.execute(
             "SELECT pg_advisory_xact_lock(%s, hashtext(%s));",
+            (source_id, f"external:{dto.external_id}"),
+        )
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s));",
             (source_id, canonical_url),
         )
         course_id, existing = self._find_course(cursor, source_id, dto.external_id, canonical_url)
-        category_id = self._category_id(cursor, source_id, dto.category_name)
         previous = self._current_version(cursor, course_id) if existing else None
         attributes = self._attributes(dto)
+        attributes["canonical_url"] = canonical_url
+        category_id = (
+            self._category_id(cursor, source_id, dto.category_name)
+            if attributes.get("category_observation") in AUTHORITATIVE_STATUSES
+            else None
+        )
         attributes = _preserve_unobserved(
             attributes,
             previous,
             {
                 "category_name": "category_observation",
                 "category": "category_observation",
-                "durations": "duration_observation",
                 "has_certificate": "certificate_observation",
                 "certificates": "certificate_observation",
                 "has_participation_certificate": "participation_certificate_observation",
@@ -1134,11 +1390,17 @@ class CourseRepository:
             },
         )
         _sort_people(attributes)
-        fingerprint = _fingerprint(attributes)
+        fingerprint = _course_fingerprint(attributes, canonical_url)
         changed = not existing or existing.get("fingerprint") != fingerprint or existing["state"] != "ACTIVE"
         if not existing:
             course_id = self._insert_course(
-                cursor, source_id, dto, category_id, canonical_url, fingerprint
+                cursor,
+                source_id,
+                dto,
+                attributes,
+                category_id,
+                canonical_url,
+                fingerprint,
             )
         else:
             self._update_course(
@@ -1178,6 +1440,35 @@ class CourseRepository:
         attributes = _dump_model(dto)
         attributes.pop("offerings", None)
         attributes.pop("raw_payload", None)
+        attributes["state"] = "ACTIVE"
+        for field, status_field in (
+            ("category_name", "category_observation"),
+            ("category", "category_observation"),
+            ("duration_hours", "duration_observation"),
+            ("durations", "duration_observation"),
+            ("has_certificate", "certificate_observation"),
+            ("certificates", "certificate_observation"),
+            (
+                "has_participation_certificate",
+                "participation_certificate_observation",
+            ),
+            ("content_items", "content_observation"),
+            ("prerequisite_items", "prerequisites_observation"),
+            ("hardware_requirements", "hardware_observation"),
+            ("software_requirements", "software_observation"),
+            ("professors", "professors_observation"),
+            ("contacts", "contacts_observation"),
+        ):
+            if attributes.get(status_field) not in AUTHORITATIVE_STATUSES:
+                attributes[field] = (
+                    False
+                    if field in {"has_certificate", "has_participation_certificate"}
+                    else []
+                    if field.endswith("items")
+                    or field.endswith("requirements")
+                    or field in {"durations", "certificates", "professors", "contacts"}
+                    else None
+                )
         return attributes
 
     @staticmethod
@@ -1253,11 +1544,10 @@ class CourseRepository:
         )
 
     @staticmethod
-    def _insert_course(cursor, source_id, dto, category_id, canonical_url, fingerprint):
-        course_attributes = _dump_model(dto)
-        duration_hours, duration_weeks, sessions_count = _course_duration_values(
-            course_attributes
-        )
+    def _insert_course(
+        cursor, source_id, dto, attributes, category_id, canonical_url, fingerprint
+    ):
+        duration_hours, duration_weeks, sessions_count = _course_duration_values(attributes)
         cursor.execute(
             """
             INSERT INTO course (
@@ -1283,8 +1573,18 @@ class CourseRepository:
                 duration_hours,
                 duration_weeks,
                 sessions_count,
-                dto.has_certificate,
-                dto.has_participation_certificate,
+                (
+                    attributes["has_certificate"]
+                    if attributes.get("certificate_observation")
+                    in AUTHORITATIVE_STATUSES
+                    else False
+                ),
+                (
+                    attributes["has_participation_certificate"]
+                    if attributes.get("participation_certificate_observation")
+                    in AUTHORITATIVE_STATUSES
+                    else False
+                ),
                 fingerprint,
             ),
         )
@@ -1427,7 +1727,193 @@ class CourseRepository:
         )
         row = cursor.fetchone()
         if not row:
-            return None
+            cursor.execute(
+                """
+                SELECT c.source_id, c.category_id, cat.name, c.duration_hours,
+                       c.duration_weeks, c.sessions_count, c.has_certificate,
+                       c.has_participation_certificate, c.state
+                  FROM course c
+                  LEFT JOIN category cat ON cat.id = c.category_id
+                 WHERE c.id = %s;
+                """,
+                (course_id,),
+            )
+            legacy = cursor.fetchone()
+            if not legacy:
+                return None
+            (
+                source_id,
+                _category_id,
+                category_name,
+                hours,
+                weeks,
+                sessions,
+                has_certificate,
+                has_participation,
+                state,
+            ) = legacy
+            cursor.execute(
+                """
+                SELECT position, text FROM course_content_item
+                 WHERE course_id = %s ORDER BY position;
+                """,
+                (course_id,),
+            )
+            content = [text for _, text in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT position, text FROM course_prerequisite_item
+                 WHERE course_id = %s ORDER BY position;
+                """,
+                (course_id,),
+            )
+            prerequisites = [text for _, text in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT kind, position, text FROM course_tech_req_item
+                 WHERE course_id = %s ORDER BY position;
+                """,
+                (course_id,),
+            )
+            requirements = cursor.fetchall()
+            hardware = [text for kind, _, text in requirements if kind == "HW"]
+            software = [text for kind, _, text in requirements if kind == "SW"]
+            cursor.execute(
+                """
+                SELECT name, phone, email FROM course_contact
+                 WHERE course_id = %s ORDER BY id;
+                """,
+                (course_id,),
+            )
+            contacts = [
+                {"name": name, "phone": phone, "email": email}
+                for name, phone, email in cursor.fetchall()
+            ]
+            cursor.execute(
+                """
+                SELECT DISTINCT p.full_name,
+                       COALESCE(psl.specialty, p.specialty)
+                  FROM course_offering o
+                  JOIN offering_professor op ON op.offering_id = o.id
+                  JOIN professor p ON p.id = op.professor_id
+                  LEFT JOIN professor_source_link psl
+                    ON psl.professor_id = p.id AND psl.source_id = %s
+                 WHERE o.course_id = %s
+                 ORDER BY p.full_name;
+                """,
+                (source_id, course_id),
+            )
+            professors = [
+                {"full_name": name, "specialty": specialty}
+                for name, specialty in cursor.fetchall()
+            ]
+            cursor.execute(
+                """
+                SELECT DISTINCT ct.code
+                  FROM course_offering o
+                  JOIN offering_certificate oc ON oc.offering_id = o.id
+                  JOIN certificate_type ct ON ct.id = oc.certificate_type_id
+                 WHERE o.course_id = %s;
+                """,
+                (course_id,),
+            )
+            certificate_codes = {code for (code,) in cursor.fetchall()}
+            durations = []
+            if hours is not None:
+                durations.append({"amount": hours, "unit": "HOUR", "original_text": None})
+            if weeks is not None:
+                durations.append({"amount": weeks, "unit": "WEEK", "original_text": None})
+            if sessions is not None:
+                durations.append(
+                    {"amount": sessions, "unit": "SESSION", "original_text": None}
+                )
+            return {
+                "category_name": category_name,
+                "category": (
+                    {
+                        "source_label": category_name,
+                        "normalized_label": None,
+                        "homologation_code": None,
+                        "observation": ObservationStatus.OBSERVED.value,
+                    }
+                    if category_name
+                    else None
+                ),
+                "category_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if category_name
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "duration_hours": hours,
+                "durations": durations,
+                "duration_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if durations
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "has_certificate": has_certificate,
+                "certificate_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if "CERTIFICADO" in certificate_codes
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "has_participation_certificate": has_participation,
+                "participation_certificate_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if "CONSTANCIA_PARTICIPACION" in certificate_codes
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "certificates": [
+                    {
+                        "kind": (
+                            "CERTIFICATE"
+                            if code == "CERTIFICADO"
+                            else "PARTICIPATION"
+                        ),
+                        "issuer": None,
+                        "description": None,
+                    }
+                    for code in sorted(certificate_codes)
+                    if code in {"CERTIFICADO", "CONSTANCIA_PARTICIPACION"}
+                ],
+                "content_items": content,
+                "content_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if content
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "prerequisite_items": prerequisites,
+                "prerequisites_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if prerequisites
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "hardware_requirements": hardware,
+                "hardware_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if hardware
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "software_requirements": software,
+                "software_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if software
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "professors": professors,
+                "professors_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if professors
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "contacts": contacts,
+                "contacts_observation": (
+                    ObservationStatus.OBSERVED.value
+                    if contacts
+                    else ObservationStatus.NOT_COLLECTED.value
+                ),
+                "state": state,
+            }
         value = row[0]
         return json.loads(value) if isinstance(value, str) else value
 
@@ -1476,7 +1962,8 @@ class CourseRepository:
                 (source_id, course_id, external_id, canonical_url, first_seen_at, last_seen_at)
             VALUES (%s, %s, %s, %s, clock_timestamp(), clock_timestamp())
             ON CONFLICT (source_id, external_id)
-            DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at
+            DO UPDATE SET canonical_url = EXCLUDED.canonical_url,
+                          last_seen_at = EXCLUDED.last_seen_at
             RETURNING course_id;
             """,
             (source_id, course_id, external_id, canonical_url),

@@ -1,9 +1,9 @@
 # CEEBI: plan incremental de refactorización
 
-Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. La Fase 1
-(línea base) y la Fase 2 (contrato común y normalización) están implementadas
-en la rama actual. Las fases restantes son propuestas; no se han aplicado
-cambios de PostgreSQL.
+Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. Las Fases 1 y 2
+están implementadas. La Fase 3 cuenta con repositorios, versionado y una
+migración SQL incremental preparada; la migración aún no se ha ejecutado y
+falta validar el flujo sobre una base PostgreSQL de pruebas aislada.
 
 ## Orden y dependencias
 
@@ -93,39 +93,43 @@ en la Fase 3.
 **Objetivo:** desacoplar la orquestación de SQL y preservar versiones de negocio
 con la ejecución que las detectó.
 
-**Archivos/componentes:** dividir `etl/services/etl_engine.py`; introducir
-`etl/persistence/` con repositorios; documentar y preparar migraciones
-aditivas para `DDL.txt` o un directorio de migraciones SQL versionadas.
+**Implementación:** `etl/services/etl_engine.py` delega en
+`etl/persistence/repositories.py` (`IngestionRepository`, `CourseRepository`,
+`OfferingRepository`, `PriceRepository`). Se mantienen SQL directo y límites
+transaccionales por curso; los fallos por curso van a cuarentena. Una captura
+con cursos en cuarentena no desactiva entidades no vistas.
 
-**Acciones:** mover SQL del motor a operaciones explícitas de repositorio;
-preservar escrituras idempotentes y transacciones actuales; añadir versiones
-temporales para cursos/ofertas y atributos acordados, con vínculo a
-`ingestion_log`; mantener el cierre de snapshots de precios existente.
-Adoptar la huella canónica solo después de comprobar el mapeo completo y
-compatibilidad; no crear versiones cuando no se detecten cambios. Definir cómo
-se ponen en cuarentena ofertas con precios o monedas que el DDL no puede
-persistir, sin sustituir el desconocido por cero o PEN.
+**Historial:** `course_version`, `course_offering_version` y
+`offering_commercial_version` guardan snapshots JSONB, fingerprints, referencias
+a ingestas y vigencias `[valid_from, valid_to)`. Constraints GIST evitan
+intervalos superpuestos. `price_snapshot` y las tablas históricas existentes de
+tiers/cuotas se conservan; no se copia en las versiones comerciales el importe
+que ya tiene historial propio.
 
-**Implementable en código sin cambio de DB:** extraer repositorios conservando
-las tablas y SQL actuales, con pruebas de contrato.
+**Identidad y datos:** `course.canonical_url` y `course_identity_alias` habilitan
+reconciliación por URL normalizada. `offering_price_observation` representa
+precios ausentes/no soportados sin cero artificial. Se reutilizan las tablas de
+docentes, contactos, certificados, horarios, contenidos y requisitos; la
+migración permite varios contactos por curso y precios/currency NULL para
+certificados sin dato publicado.
 
-**Requiere cambio de PostgreSQL:** tablas/columnas/constraints de historial,
-FK a ejecución, y cualquier campo no persistido que se acuerde conservar.
+**Migración:** `database/migrations/003_persistence_history.sql` es aditiva,
+versionada, no se ha ejecutado y requiere permisos para `btree_gist`. Respaldo
+antes de aplicar; rollback de aplicación dejando intactos los objetos y datos
+aditivos. La referencia a una ingesta puede quedar NULL por la política de
+retención de logs, asunto que requiere decisión antes de purgar históricos.
 
-**Dependencias:** Fases 1 y 2, además del diseño de granularidad temporal.
+**Pruebas ejecutadas:** 47 pruebas offline de ETL, extractores, adaptadores,
+catálogos y persistencia unitaria pasan. No se conectó a la base por defecto.
+No existe configuración de PostgreSQL de pruebas aislada; por tanto, no se
+verificaron migración, constraints reales, transacciones ni idempotencia
+concurrente en PostgreSQL.
 
-**Riesgos:** duplicar eventos entre `change_log` e historial; diferencias
-concurrentes; registros sin historial previo; tratar ausencia por extracción
-incompleta como eliminación real.
-
-**Pruebas necesarias:** no-op no versiona; cambios de cada campo relevante
-versionan una vez; toda versión referencia la ingesta correcta; transacción
-rollback; ejecución repetida es idempotente; curso ausente en captura parcial
-no se desactiva; datos monetarios desconocidos no producen snapshots falsos y
-quedan visibles como errores/cuarentena.
-
-**Termina cuando:** se pueden consultar estados actuales y pasados, y ninguna
-versión normalizada se elimina automáticamente.
+**Pendiente para cierre de despliegue:** ejecutar la migración y pruebas de
+integración solo en una base aislada, verificar datos duplicados/preflight,
+rollback de una transacción, historial temporal, snapshots de precios,
+idempotencia y ambos extractores. No avanzar a Fase 4 antes de la autorización
+del usuario.
 
 ## Fase 4 — Identidad y operación confiable
 

@@ -124,7 +124,8 @@ class ETLEngine:
                 )
 
             with transaction.atomic(), connection.cursor() as cursor:
-                self._mark_missing(cursor, source_id, ingestion_id, run_start)
+                if not counts["quarantined"]:
+                    self._mark_missing(cursor, source_id, ingestion_id, run_start)
                 self._finish_ingestion(
                     cursor,
                     ingestion_id,

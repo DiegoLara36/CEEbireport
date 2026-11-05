@@ -41,6 +41,15 @@ El `change_log` actual no basta como versión completa: `course` y
 versionado temporal consultable sin retirar las tablas actuales hasta validar
 la migración.
 
+Implementación Fase 3: `course_version`, `course_offering_version` y
+`offering_commercial_version` guardan snapshots JSONB con `valid_from`,
+`valid_to`, fingerprint y referencia a `ingestion_log`. Constraints de
+exclusión temporal impiden intervalos superpuestos. `price_snapshot`,
+`offering_price_tier` y `payment_plan` conservan sus propios historiales; el
+historial comercial no copia los importes persistidos. Los registros históricos
+dejan la referencia ETL en NULL cuando la política de retención elimina la
+corrida, por lo que su vínculo solo es permanente si se revisa esa política.
+
 ### ADR-02 — Identidad de cursos y ofertas
 
 Usar primero el identificador estable provisto por la institución. Cuando no
@@ -52,6 +61,11 @@ Hoy `course.external_id` es obligatorio y la unicidad es
 `(source_id, external_id)`; el DTO común también exige `external_id`. Habilitar
 el fallback requerirá acordar su representación antes de cambiar el esquema o
 los datos.
+
+Implementación Fase 3: `course.canonical_url` y `course_identity_alias`
+permiten reconciliar un identificador externo nuevo con una URL canónica ya
+conocida. La identidad sigue sin basarse en el nombre. La unicidad de URL es
+por fuente y solo aplica a valores no nulos.
 
 ### ADR-03 — Homologación
 
@@ -97,6 +111,11 @@ directo seguirá siendo responsable de las escrituras ETL existentes. Evaluar
 Django ORM primero para CRUD y relaciones sencillas; mantener SQL donde sus
 características de PostgreSQL, el rendimiento o la consulta analítica lo
 justifiquen.
+
+Implementación Fase 3: `ETLEngine` coordina extracción/validación y delega
+persistencia en `IngestionRepository`, `CourseRepository`,
+`OfferingRepository` y `PriceRepository`. La escritura sigue usando SQL directo
+y transacciones Django; no se inició una migración global al ORM.
 
 La propiedad del esquema se declarará por tabla: mientras DDL/SQL sea dueño,
 Django migrations no deberá modificar esa tabla; al transferir propiedad, se
@@ -145,11 +164,13 @@ ISO 4217. Los reportes no sumarán ni compararán importes de monedas distintas
 como si fueran equivalentes. Una conversión futura requerirá tabla de tipos de
 cambio históricos y fecha/fuente de conversión; no se introduce ahora.
 
-El DTO de Fase 2 conserva códigos alfabéticos de tres letras y reconoce
-símbolos inequívocos; el DDL operativo sigue restringido a `PEN`/`USD`.
-Ampliar la persistencia a otros códigos ISO requiere actualizar y probar sus
-constraints sin perder importes existentes. La validación Pydantic comprueba el
-formato, no la asignación del código en el registro ISO.
+El DTO conserva códigos alfabéticos de tres letras y reconoce símbolos
+inequívocos; `price_snapshot`, niveles y planes operativos continúan restringidos
+a `PEN`/`USD`. La Fase 3 registra por separado la observación monetaria, el
+importe/moneda crudos y estados como no publicado, desconocido, moneda no
+identificada o no soportada. Una observación no soportada no crea un snapshot
+ficticio. La validación Pydantic comprueba el formato, no la asignación del
+código en el registro ISO.
 
 ### ADR-10 — Metabase y seguridad de integración
 
@@ -162,7 +183,7 @@ Antes de implementar, confirmar en la instancia objetivo versión, edición,
 licencia y capacidades de embedding. La base de datos de metadatos de Metabase
 será distinta de la base de negocio consultada.
 
-## Estado al cierre de la Fase 2
+## Estado de implementación al cierre de la Fase 3
 
 - `etl/schemas.py` separa el contrato de extracción PUCP del DTO común de
   curso/ofertas y conserva los campos planos que consume `ETLEngine`. El DTO
@@ -180,21 +201,24 @@ será distinta de la base de negocio consultada.
   contenido normalizado, ignorando los payloads crudos y ordenando horarios.
   Es una API de datos para pruebas y evolución; `ETLEngine` todavía usa su hash
   anterior y no consume esta huella.
-- La moneda acepta códigos alfabéticos de tres letras en el DTO, pero ese
-  formato no verifica por sí solo que el código esté asignado en ISO 4217. El
-  DDL actual restringe la persistencia a PEN/USD; una moneda distinta o
-  desconocida requiere resolver esa incompatibilidad en una fase posterior.
-  Un `$` sin más evidencia se conserva como texto y no se interpreta como USD.
-- Precios ausentes permanecen como `None` con estado `NOT_FOUND`, no como cero.
-  La persistencia actual requiere importes para escribir un snapshot; por ello,
-  una oferta Cibertec sin precio todavía no es persistible de forma segura.
-  Resolver su cuarentena/soporte opcional forma parte de la Fase 3.
-- PUCP conserva el docente y el contacto que antes se perdían en el adaptador.
-  Cibertec expresa docentes/contactos como `NOT_COLLECTED`, no como ausencia
-  confirmada. La persistencia actual aún no guarda esos campos y sus estados.
-- No se modificaron ETLEngine, DDL, comandos ni escrituras SQL. La huella
-  canónica no cambia la detección de modificaciones de producción. La
-  verificación fixture-based ejecutó 37 pruebas sin preparar la base de datos.
+- La Fase 3 integra fingerprints independientes en repositorios. Ignoran los
+  payloads crudos y diferencias de formato de modalidad/horario y normalizan
+  listas no ordenadas; los estados de observación evitan borrar datos que no
+  fueron recopilados.
+- Precios sin importe no se convierten en cero: `offering_price_observation`
+  conserva el estado y los datos originales opcionales. Solo se insertan
+  `price_snapshot` cuando existe precio publicado con moneda soportada.
+- Docentes, especialidades y enlaces a ofertas se guardan en las tablas
+  existentes; contactos admiten varios por curso tras retirar su unicidad
+  singular. Certificados conservan la información descriptiva en la versión y
+  su tipo consultable en `offering_certificate`, con precio NULL si no se
+  conoce.
+- Se creó `database/migrations/003_persistence_history.sql`; no se ejecutó.
+  Requiere validar privilegios para `btree_gist` y aplicarse primero sobre una
+  base de pruebas aislada con respaldo.
+- `PucpETLService` se conserva sin cambios. No se conectó a PostgreSQL ni se
+  ejecutaron capturas. Las pruebas offline pasan; la integración transaccional
+  sobre PostgreSQL queda pendiente de disponer de una base de pruebas aislada.
 
 ## Clasificación de cambios
 

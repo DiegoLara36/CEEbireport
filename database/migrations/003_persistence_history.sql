@@ -30,6 +30,9 @@ CREATE INDEX IF NOT EXISTS idx_course_identity_alias_course
 ALTER TABLE course_contact
     DROP CONSTRAINT IF EXISTS uq_course_contact;
 
+ALTER TABLE professor_source_link
+    ADD COLUMN IF NOT EXISTS specialty TEXT;
+
 CREATE TABLE IF NOT EXISTS course_version (
     id BIGSERIAL PRIMARY KEY,
     course_id BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
