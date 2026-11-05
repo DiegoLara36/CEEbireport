@@ -6,6 +6,7 @@ from etl.normalization import (
     normalize_currency,
     normalize_duration,
     normalize_modality,
+    classify_price,
 )
 from etl.schemas import (
     CertificateSchema,
@@ -224,10 +225,13 @@ def adapt_pucp_course(data: CourseExtractedSchema) -> ScrapedCourseDTO:
                 ),
                 list_amount=data.price_amount,
                 final_amount=data.price_amount,
-                price_tiers=tiers,
-                discounts=discounts,
-                payment_plans=payment_plans,
                 price_observation=data.price_observation,
+                price_status=classify_price(
+                    data.price_amount,
+                    data.currency,
+                    data.price_observation,
+                ),
+                price_raw=data.price_raw,
                 commercial_conditions=(
                     [data.target_audience_raw] if data.target_audience_raw else []
                 ),
@@ -235,6 +239,24 @@ def adapt_pucp_course(data: CourseExtractedSchema) -> ScrapedCourseDTO:
                     ObservationStatus.OBSERVED
                     if data.target_audience_raw
                     else ObservationStatus.NOT_FOUND
+                ),
+                discounts=discounts,
+                discounts_observation=(
+                    ObservationStatus.OBSERVED
+                    if data.price_details_raw
+                    else ObservationStatus.NOT_COLLECTED
+                ),
+                price_tiers=tiers,
+                price_tiers_observation=(
+                    ObservationStatus.OBSERVED
+                    if data.price_details_raw
+                    else ObservationStatus.NOT_COLLECTED
+                ),
+                payment_plans=payment_plans,
+                payment_plans_observation=(
+                    ObservationStatus.OBSERVED
+                    if data.price_details_raw
+                    else ObservationStatus.NOT_COLLECTED
                 ),
                 raw_payload=raw_payload,
             )
@@ -280,5 +302,10 @@ def adapt_cibertec_course(data: ScrapedCourseDTO) -> ScrapedCourseDTO:
             ObservationStatus.OBSERVED
             if offering.currency
             else ObservationStatus.UNKNOWN
+        )
+        offering.price_status = classify_price(
+            offering.final_amount,
+            offering.currency,
+            offering.price_observation,
         )
     return data

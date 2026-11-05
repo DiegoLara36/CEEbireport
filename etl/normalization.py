@@ -2,6 +2,7 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from django.utils.text import slugify
 
@@ -10,6 +11,7 @@ from etl.schemas import (
     DurationSchema,
     NormalizedModality,
     ObservationStatus,
+    PriceStatus,
 )
 
 
@@ -151,3 +153,36 @@ def normalize_category(value: Optional[str]) -> Optional[CategorySchema]:
         normalized_label=slugify(label).replace("-", "_") or None,
         observation=ObservationStatus.OBSERVED,
     )
+
+
+def classify_price(
+    amount: Optional[Decimal],
+    currency: Optional[str],
+    observation: ObservationStatus,
+) -> PriceStatus:
+    if amount is None:
+        return PriceStatus.UNKNOWN
+    if currency is None:
+        return PriceStatus.CURRENCY_UNIDENTIFIED
+    if currency not in {"PEN", "USD"}:
+        return PriceStatus.CURRENCY_UNSUPPORTED
+    if observation == ObservationStatus.NOT_FOUND:
+        return PriceStatus.UNKNOWN
+    return PriceStatus.PUBLISHED
+
+
+def canonicalize_course_url(value: str) -> str:
+    parts = urlsplit(value.strip())
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+        raise ValueError(f"URL de curso inválida para identidad: {value!r}")
+    scheme = parts.scheme.lower()
+    hostname = parts.hostname.lower()
+    port = parts.port
+    netloc = hostname
+    if port and not (
+        (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    ):
+        netloc = f"{hostname}:{port}"
+    path = re.sub(r"/+", "/", parts.path or "/").rstrip("/") or "/"
+    return urlunsplit((scheme, netloc, path, "", ""))

@@ -474,7 +474,16 @@ class CibertecExtractor:
                     else ObservationStatus.NOT_FOUND
                 ),
                 discounts=discounts,
+                discounts_observation=ObservationStatus.OBSERVED,
                 payment_plans=self._payment_plans(benefits),
+                payment_plans_observation=(
+                    ObservationStatus.OBSERVED
+                    if benefits
+                    else ObservationStatus.NOT_FOUND
+                ),
+                commercial_conditions=([benefits] if benefits else []),
+                commercial_conditions_observation=ObservationStatus.OBSERVED,
+                price_raw=current_price_text,
                 raw_payload={
                     "cohort": cohort,
                     "benefits": benefits,

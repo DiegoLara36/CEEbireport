@@ -3,7 +3,7 @@ import json
 from datetime import date, time
 from decimal import Decimal
 from enum import StrEnum
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from django.utils.text import slugify
 from pydantic import BaseModel, Field, HttpUrl, model_validator
@@ -27,6 +27,14 @@ class PublicationStatus(StrEnum):
     UNPUBLISHED = "UNPUBLISHED"
     CANCELLED = "CANCELLED"
     FINISHED = "FINISHED"
+
+
+class PriceStatus(StrEnum):
+    PUBLISHED = "PUBLISHED"
+    NOT_PUBLISHED = "NOT_PUBLISHED"
+    UNKNOWN = "UNKNOWN"
+    CURRENCY_UNIDENTIFIED = "CURRENCY_UNIDENTIFIED"
+    CURRENCY_UNSUPPORTED = "CURRENCY_UNSUPPORTED"
 
 
 class ScheduleItemSchema(BaseModel):
@@ -184,14 +192,19 @@ class ScrapedOfferingDTO(BaseModel):
     list_amount: Optional[Decimal] = Field(..., ge=0)
     final_amount: Optional[Decimal] = Field(..., ge=0)
     price_observation: ObservationStatus = ObservationStatus.UNKNOWN
+    price_status: PriceStatus = PriceStatus.UNKNOWN
     discounts: list[ScrapedDiscountDTO] = Field(default_factory=list)
+    discounts_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     price_tiers: list[ScrapedPriceTierDTO] = Field(default_factory=list)
+    price_tiers_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     payment_plans: list[ScrapedPaymentPlanDTO] = Field(default_factory=list)
+    payment_plans_observation: ObservationStatus = ObservationStatus.NOT_COLLECTED
     commercial_conditions: list[str] = Field(default_factory=list)
     commercial_conditions_observation: ObservationStatus = (
         ObservationStatus.NOT_COLLECTED
     )
     raw_payload: dict = Field(default_factory=dict)
+    price_raw: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_offering(self) -> "ScrapedOfferingDTO":
@@ -208,6 +221,63 @@ class ScrapedOfferingDTO(BaseModel):
                     else self.start_date.isoformat()
                 )
         return self
+
+    def canonical_fingerprints(self) -> dict[str, str]:
+        offer_data = self.model_dump(
+            mode="json",
+            exclude={
+                "list_amount",
+                "final_amount",
+                "currency",
+                "currency_raw",
+                "currency_observation",
+                "price_observation",
+                "price_status",
+                "discounts",
+                "price_tiers",
+                "payment_plans",
+                "commercial_conditions",
+                "commercial_conditions_observation",
+                "raw_payload",
+            },
+        )
+        offer_data["schedules"] = sorted(
+            offer_data["schedules"],
+            key=lambda row: (
+                row["day_of_week"],
+                row["start_time"],
+                row["end_time"],
+            ),
+        )
+        for duration in offer_data["durations"]:
+            duration.pop("original_text", None)
+        commercial_data = {
+            "price_status": self.price_status.value,
+            "price_observation": self.price_observation.value,
+            "list_amount": str(self.list_amount)
+            if self.list_amount is not None
+            else None,
+            "final_amount": str(self.final_amount)
+            if self.final_amount is not None
+            else None,
+            "currency": self.currency,
+            "currency_observation": self.currency_observation.value,
+            "discounts": [item.model_dump(mode="json") for item in self.discounts],
+            "price_tiers": [item.model_dump(mode="json") for item in self.price_tiers],
+            "payment_plans": [item.model_dump(mode="json") for item in self.payment_plans],
+            "commercial_conditions": self.commercial_conditions,
+            "commercial_conditions_observation": (
+                self.commercial_conditions_observation.value
+            ),
+        }
+        for field in ("discounts", "price_tiers", "payment_plans"):
+            commercial_data[field].sort(
+                key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False)
+            )
+        return {
+            "offering": _fingerprint(offer_data),
+            "commercial": _fingerprint(commercial_data),
+        }
 
 
 class ScrapedCourseDTO(BaseModel):
@@ -271,14 +341,38 @@ class ScrapedCourseDTO(BaseModel):
             )
         return content
 
+    def canonical_fingerprints(self) -> dict[str, Any]:
+        course = self.model_dump(
+            mode="json",
+            exclude={
+                "offerings",
+                "raw_payload",
+            },
+        )
+        for duration in course.get("durations", []):
+            duration.pop("original_text", None)
+
+        return {
+            "course": _fingerprint(course),
+            "offerings": {
+                offering.external_code: offering.canonical_fingerprints()
+                for offering in self.offerings
+            },
+        }
+
     def canonical_fingerprint(self) -> str:
-        encoded = json.dumps(
-            self.canonical_content(),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        return _fingerprint(self.canonical_content())
+
+
+def _fingerprint(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def pucp_course_to_dto(data: CourseExtractedSchema) -> ScrapedCourseDTO:
