@@ -116,6 +116,7 @@ class CibertecExtractor:
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
         self.raw_pages: list[tuple[str, bytes]] = []
+        self.catalog_complete = False
         self._playwright = None
         self._browser = None
         self._page = None
@@ -154,6 +155,7 @@ class CibertecExtractor:
         self._page = self._browser = self._playwright = None
 
     def fetch_catalog_index(self) -> list[dict[str, Any]]:
+        self.catalog_complete = False
         self.start()
         response = self._page.goto(
             self.base_url, wait_until="networkidle", timeout=self.timeout * 1000
@@ -230,12 +232,13 @@ class CibertecExtractor:
                 "a[aria-label*='Siguiente']"
             ).first
             if next_button.count() == 0 or next_button.is_disabled():
+                self.catalog_complete = True
                 break
             previous_title = (
                 self._page.locator("#catalog-cursos article h3").first.inner_text().strip()
             )
-            next_button.click()
             try:
+                next_button.click()
                 self._page.wait_for_function(
                     """previous => {
                         const title = document.querySelector('#catalog-cursos article h3');

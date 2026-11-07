@@ -3,6 +3,37 @@
 -- btree_gist. Do not run DDL.txt; it is a destructive schema reference.
 BEGIN;
 
+DO $preflight$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_extension
+         WHERE extname = 'btree_gist'
+    ) AND NOT EXISTS (
+        SELECT 1
+          FROM pg_available_extensions
+         WHERE name = 'btree_gist'
+    ) THEN
+        RAISE EXCEPTION
+            'Phase 3 migration requires btree_gist, but it is not available on this PostgreSQL server';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_extension
+         WHERE extname = 'btree_gist'
+    ) AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
+      AND NOT EXISTS (
+        SELECT 1
+          FROM pg_roles
+         WHERE rolname = current_user AND rolsuper
+    ) THEN
+        RAISE EXCEPTION
+            'Phase 3 migration requires btree_gist and permission to create the extension in this database';
+    END IF;
+END;
+$preflight$;
+
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 ALTER TABLE course
@@ -36,8 +67,7 @@ ALTER TABLE professor_source_link
 CREATE TABLE IF NOT EXISTS course_version (
     id BIGSERIAL PRIMARY KEY,
     course_id BIGINT NOT NULL REFERENCES course(id) ON DELETE CASCADE,
-    ingestion_id BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
-    ingestion_id_original BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
+    ingestion_id BIGINT NOT NULL REFERENCES ingestion_log(id) ON DELETE RESTRICT,
     fingerprint TEXT NOT NULL,
     attributes JSONB NOT NULL,
     valid_from TIMESTAMPTZ NOT NULL,
@@ -57,8 +87,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_course_version_current
 CREATE TABLE IF NOT EXISTS course_offering_version (
     id BIGSERIAL PRIMARY KEY,
     offering_id BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
-    ingestion_id BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
-    ingestion_id_original BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
+    ingestion_id BIGINT NOT NULL REFERENCES ingestion_log(id) ON DELETE RESTRICT,
     fingerprint TEXT NOT NULL,
     attributes JSONB NOT NULL,
     valid_from TIMESTAMPTZ NOT NULL,
@@ -78,8 +107,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_course_offering_version_current
 CREATE TABLE IF NOT EXISTS offering_commercial_version (
     id BIGSERIAL PRIMARY KEY,
     offering_id BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
-    ingestion_id BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
-    ingestion_id_original BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
+    ingestion_id BIGINT NOT NULL REFERENCES ingestion_log(id) ON DELETE RESTRICT,
     price_snapshot_id BIGINT REFERENCES price_snapshot(id) ON DELETE SET NULL,
     fingerprint TEXT NOT NULL,
     attributes JSONB NOT NULL,
@@ -100,7 +128,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_offering_commercial_version_current
 CREATE TABLE IF NOT EXISTS offering_price_observation (
     id BIGSERIAL PRIMARY KEY,
     offering_id BIGINT NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
-    ingestion_id BIGINT REFERENCES ingestion_log(id) ON DELETE SET NULL,
+    ingestion_id BIGINT NOT NULL REFERENCES ingestion_log(id) ON DELETE RESTRICT,
     status TEXT NOT NULL CHECK (status IN (
         'PUBLISHED', 'NOT_PUBLISHED', 'UNKNOWN',
         'CURRENCY_UNIDENTIFIED', 'CURRENCY_UNSUPPORTED'
@@ -122,15 +150,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_offering_price_observation_current
 
 ALTER TABLE price_snapshot
     ADD COLUMN IF NOT EXISTS ingestion_id BIGINT
-        REFERENCES ingestion_log(id) ON DELETE SET NULL;
+        REFERENCES ingestion_log(id) ON DELETE RESTRICT;
 
 ALTER TABLE offering_price_tier
     ADD COLUMN IF NOT EXISTS ingestion_id BIGINT
-        REFERENCES ingestion_log(id) ON DELETE SET NULL;
+        REFERENCES ingestion_log(id) ON DELETE RESTRICT;
 
 ALTER TABLE payment_plan
     ADD COLUMN IF NOT EXISTS ingestion_id BIGINT
-        REFERENCES ingestion_log(id) ON DELETE SET NULL;
+        REFERENCES ingestion_log(id) ON DELETE RESTRICT;
 
 ALTER TABLE offering_certificate
     ALTER COLUMN price DROP NOT NULL,
@@ -138,12 +166,29 @@ ALTER TABLE offering_certificate
     ALTER COLUMN currency DROP NOT NULL,
     ALTER COLUMN currency DROP DEFAULT;
 
+CREATE OR REPLACE FUNCTION fn_preserve_ingestion_log()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION
+        'ingestion_log rows are permanent provenance records; redact diagnostics instead of deleting the run';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tg_preserve_ingestion_log ON ingestion_log;
+CREATE TRIGGER tg_preserve_ingestion_log
+BEFORE DELETE ON ingestion_log
+FOR EACH ROW EXECUTE FUNCTION fn_preserve_ingestion_log();
+
+COMMENT ON TABLE ingestion_log IS
+    'Permanent minimum provenance for ETL runs; redact error_msg rather than deleting rows.';
+COMMENT ON COLUMN ingestion_log.error_msg IS
+    'Diagnostic text may be purged after retention; the run row and its identifiers remain permanent.';
 COMMENT ON TABLE course_version IS
-    'Temporal snapshots of normalized course attributes; ingestion references may be nulled by retention.';
+    'Temporal snapshots of normalized course attributes with permanent ingestion provenance.';
 COMMENT ON TABLE course_offering_version IS
-    'Temporal snapshots of normalized offering attributes; pricing remains in price_snapshot.';
+    'Temporal snapshots of normalized offering attributes with permanent ingestion provenance; pricing remains in price_snapshot.';
 COMMENT ON TABLE offering_commercial_version IS
-    'Temporal commercial conditions; price values remain in price_snapshot and related price history.';
+    'Temporal commercial conditions with permanent ingestion provenance; price values remain in price_snapshot and related price history.';
 COMMENT ON TABLE offering_price_observation IS
     'Observed pricing state, including absent or unsupported currency without inventing a numeric price.';
 COMMENT ON COLUMN offering_certificate.price IS

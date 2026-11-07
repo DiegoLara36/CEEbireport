@@ -1,6 +1,8 @@
 from datetime import date, time
 from decimal import Decimal
 from pathlib import Path
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import requests
@@ -149,6 +151,7 @@ class PucpFixtureBaselineTests(SimpleTestCase):
         self.assertEqual(courses[1]["curso"], "Curso de Gestión de Proyectos")
         self.assertEqual(fetch_page.call_count, 2)
         sleep.assert_called_once_with(1.0)
+        self.assertTrue(extractor.catalog_complete)
 
     def test_catalog_skips_a_later_page_when_http_request_fails(self):
         first = fixture_text("pucp_catalog_page_1.html")
@@ -168,6 +171,7 @@ class PucpFixtureBaselineTests(SimpleTestCase):
 
         self.assertEqual(len(courses), 1)
         self.assertEqual(courses[0]["curso"], "Curso de Analítica de Datos")
+        self.assertFalse(extractor.catalog_complete)
 
     def test_detail_and_adapter_baseline(self):
         html = fixture_text("pucp_course_detail.html")
@@ -236,6 +240,7 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
             "https://educacioncontinua.cibertec.edu.pe/cursos/power-bi-avanzado/"
         ))
         self.assertEqual(len(extractor.raw_pages), 1)
+        self.assertTrue(extractor.catalog_complete)
 
     def test_catalog_selector_timeout_returns_empty_and_keeps_raw_html(self):
         html = fixture_text("cibertec_catalog.html")
@@ -252,6 +257,7 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
 
         self.assertEqual(courses, [])
         self.assertEqual(extractor.raw_pages, [(extractor.base_url, html.encode("utf-8"))])
+        self.assertFalse(extractor.catalog_complete)
 
     def test_catalog_pagination_clicks_next_page_and_records_both_fixtures(self):
         first_html = fixture_text("cibertec_catalog.html")
@@ -285,6 +291,31 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         next_button.click.assert_called_once_with()
         page.wait_for_function.assert_called_once()
         self.assertEqual(len(extractor.raw_pages), 2)
+        self.assertTrue(extractor.catalog_complete)
+
+    def test_catalog_pagination_timeout_is_reported_as_incomplete(self):
+        first_html = fixture_text("cibertec_catalog.html")
+        extractor = CibertecExtractor(timeout=1)
+        page = Mock()
+        page.goto.return_value.status = 200
+        page.url = extractor.base_url
+        page.content.return_value = first_html
+        next_button = Mock()
+        next_button.first = next_button
+        next_button.count.return_value = 1
+        next_button.is_disabled.return_value = False
+        heading = Mock()
+        heading.first = heading
+        heading.inner_text.return_value = "Actualización en Analítica"
+        page.locator.side_effect = [next_button, heading]
+        page.wait_for_function.side_effect = TimeoutError("pagination timeout")
+        extractor._page = page
+
+        with patch.object(extractor, "start"):
+            courses = extractor.fetch_catalog_index()
+
+        self.assertEqual(len(courses), 2)
+        self.assertFalse(extractor.catalog_complete)
 
     def test_detail_parser_maps_fixture_content_cohort_and_commercial_fields(self):
         html = fixture_text("cibertec_course_detail.html")
@@ -362,6 +393,45 @@ class EtlEnginePureLogicBaselineTests(SimpleTestCase):
     def test_unsupported_source_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Fuente no soportada"):
             ETLEngine("UPC")
+
+    def test_incomplete_catalog_never_marks_unseen_courses_missing(self):
+        engine = ETLEngine("PUCP")
+        engine.extractor = Mock()
+        engine.extractor.fetch_catalog_index.return_value = [{"url": "https://example.test/course"}]
+        engine.extractor.catalog_complete = False
+        engine._start_ingestion = Mock(return_value=(1, 2))
+        engine._active_course_count = Mock(return_value=1)
+        engine._extract_one = Mock(return_value=ScrapedCourseDTO(
+            source_code="PUCP",
+            external_id="course",
+            course_url="https://example.test/course",
+            name="Test course",
+            offerings=[ScrapedOfferingDTO(list_amount=None, final_amount=None)],
+        ))
+        engine._persist_course = Mock(
+            return_value={"course_changed": 0, "offerings_changed": 0}
+        )
+        engine._save_raw_pages = Mock(return_value=0)
+        engine._minimum_courses_pct = Mock(return_value=20)
+        engine._mark_missing = Mock()
+        engine._finish_ingestion = Mock()
+        engine._purge_raw_pages = Mock()
+        engine.resilience.succeeded = Mock()
+        engine.ensure_sources = Mock()
+        cursor = Mock()
+
+        with (
+            patch(
+                "etl.services.etl_engine.connection",
+                SimpleNamespace(cursor=Mock(return_value=nullcontext(cursor))),
+            ),
+            patch("etl.services.etl_engine.transaction.atomic", return_value=nullcontext()),
+        ):
+            result = engine.run()
+
+        engine._mark_missing.assert_not_called()
+        self.assertEqual(result["status"], "PARTIAL")
+        self.assertFalse(result["catalog_complete"])
 
     def test_unchanged_price_reuses_current_snapshot(self):
         engine = ETLEngine("PUCP")

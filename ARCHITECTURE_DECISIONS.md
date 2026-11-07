@@ -46,9 +46,9 @@ Implementación Fase 3: `course_version`, `course_offering_version` y
 `valid_to`, fingerprint y referencia a `ingestion_log`. Constraints de
 exclusión temporal impiden intervalos superpuestos. `price_snapshot`,
 `offering_price_tier` y `payment_plan` conservan sus propios historiales; el
-historial comercial no copia los importes persistidos. Los registros históricos
-dejan la referencia ETL en NULL cuando la política de retención elimina la
-corrida, por lo que su vínculo solo es permanente si se revisa esa política.
+historial comercial no copia los importes persistidos. Las versiones conservan
+una referencia obligatoria y restrictiva a `ingestion_log`; la fila mínima de
+cada corrida no se elimina y los textos de diagnóstico se pueden redactar.
 
 ### ADR-02 — Identidad de cursos y ofertas
 
@@ -149,8 +149,8 @@ auditoría:
 
 No ejecutar limpieza automática del historial normalizado. Hoy
 `ETLEngine._purge_raw_pages()` elimina `raw_page` según
-`retention_raw_page_days`; no se encontró limpieza implementada para logs ETL o
-cuarentenas. Para cumplir los 90 días de datos crudos también habrá que revisar
+`retention_raw_page_days`; la migración impide borrar filas de
+`ingestion_log`. Para cumplir los 90 días de datos crudos también habrá que revisar
 `raw_payload` que esté embebido en snapshots u otros registros históricos:
 conservar los valores normalizados indefinidamente no implica conservar el
 HTML o payload original indefinidamente. Para retener cuarentenas desde su
@@ -205,6 +205,9 @@ será distinta de la base de negocio consultada.
   payloads crudos y diferencias de formato de modalidad/horario y normalizan
   listas no ordenadas; los estados de observación evitan borrar datos que no
   fueron recopilados.
+- Los docentes se resuelven por nombre dentro del `source_id` mediante
+  `professor_source_link`; la paginación incompleta se señala explícitamente y
+  bloquea `mark_missing`, incluso cuando se cumple el umbral mínimo.
 - Precios sin importe no se convierten en cero: `offering_price_observation`
   conserva el estado y los datos originales opcionales. Solo se insertan
   `price_snapshot` cuando existe precio publicado con moneda soportada.
@@ -213,12 +216,13 @@ será distinta de la base de negocio consultada.
   singular. Certificados conservan la información descriptiva en la versión y
   su tipo consultable en `offering_certificate`, con precio NULL si no se
   conoce.
-- Se creó `database/migrations/003_persistence_history.sql`; no se ejecutó.
-  Requiere validar privilegios para `btree_gist` y aplicarse primero sobre una
-  base de pruebas aislada con respaldo.
-- `PucpETLService` se conserva sin cambios. No se conectó a PostgreSQL ni se
-  ejecutaron capturas. Las pruebas offline pasan; la integración transaccional
-  sobre PostgreSQL queda pendiente de disponer de una base de pruebas aislada.
+- `database/migrations/003_persistence_history.sql` valida `btree_gist` antes
+  de modificar el esquema y conserva las filas mínimas de `ingestion_log`.
+  Bootstrap, migración y pruebas de integración pasaron en `ceebi_phase3_test`.
+- Las pruebas offline de ETL/catálogo pasan **52/52**; la suite PostgreSQL pasa
+  **8/8** casos de integración y **3/3** comprobaciones de seguridad.
+- `PucpETLService` se conserva sin cambios y no se ejecutaron capturas reales.
+  La Fase 3 está validada en la base aislada; la Fase 4 no se ha iniciado.
 
 ## Clasificación de cambios
 

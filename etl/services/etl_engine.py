@@ -63,6 +63,7 @@ class ETLEngine:
             "http_errors": 0,
             "courses_changed": 0,
             "offerings_changed": 0,
+            "catalog_complete": False,
         }
         self.ensure_sources([self.source_code])
         source_id, ingestion_id = self._start_ingestion(run_start)
@@ -70,8 +71,13 @@ class ETLEngine:
         try:
             active_count_before = self._active_course_count(source_id)
             catalog = self.extractor.fetch_catalog_index()
+            catalog_complete = bool(
+                getattr(self.extractor, "catalog_complete", False)
+            )
             if limit is not None:
+                catalog_complete = catalog_complete and len(catalog) <= limit
                 catalog = catalog[:limit]
+            counts["catalog_complete"] = catalog_complete
             counts["discovered"] = len(catalog)
             if not catalog:
                 raise IngestionFailure(
@@ -124,17 +130,22 @@ class ETLEngine:
                 )
 
             with transaction.atomic(), connection.cursor() as cursor:
-                if not counts["quarantined"]:
+                if not counts["quarantined"] and catalog_complete:
                     self._mark_missing(cursor, source_id, ingestion_id, run_start)
+                run_status = (
+                    "PARTIAL"
+                    if counts["quarantined"] or not catalog_complete
+                    else "OK"
+                )
                 self._finish_ingestion(
                     cursor,
                     ingestion_id,
-                    "PARTIAL" if counts["quarantined"] else "OK",
+                    run_status,
                     counts,
                 )
                 self.resilience.succeeded(cursor, source_id)
                 self._purge_raw_pages(cursor)
-            counts["status"] = "PARTIAL" if counts["quarantined"] else "OK"
+            counts["status"] = run_status
             return counts
         except Exception as exc:
             error_message = "".join(

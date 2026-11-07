@@ -1,9 +1,7 @@
 # CEEBI: plan incremental de refactorización
 
-Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. Las Fases 1 y 2
-están implementadas. La Fase 3 cuenta con repositorios, versionado y una
-migración SQL incremental preparada; la migración aún no se ha ejecutado y
-falta validar el flujo sobre una base PostgreSQL de pruebas aislada.
+Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. Las Fases 1, 2 y
+3 están implementadas y validadas; la Fase 4 no se ha iniciado.
 
 ## Orden y dependencias
 
@@ -97,7 +95,8 @@ con la ejecución que las detectó.
 `etl/persistence/repositories.py` (`IngestionRepository`, `CourseRepository`,
 `OfferingRepository`, `PriceRepository`). Se mantienen SQL directo y límites
 transaccionales por curso; los fallos por curso van a cuarentena. Una captura
-con cursos en cuarentena no desactiva entidades no vistas.
+con cursos en cuarentena o paginación incompleta no desactiva entidades no
+vistas.
 
 **Historial:** `course_version`, `course_offering_version` y
 `offering_commercial_version` guardan snapshots JSONB, fingerprints, referencias
@@ -111,25 +110,20 @@ reconciliación por URL normalizada. `offering_price_observation` representa
 precios ausentes/no soportados sin cero artificial. Se reutilizan las tablas de
 docentes, contactos, certificados, horarios, contenidos y requisitos; la
 migración permite varios contactos por curso y precios/currency NULL para
-certificados sin dato publicado.
+certificados sin dato publicado. La búsqueda de docentes está limitada por
+fuente; paginación incompleta bloquea la desactivación de entidades ausentes.
 
 **Migración:** `database/migrations/003_persistence_history.sql` es aditiva,
-versionada, no se ha ejecutado y requiere permisos para `btree_gist`. Respaldo
-antes de aplicar; rollback de aplicación dejando intactos los objetos y datos
-aditivos. La referencia a una ingesta puede quedar NULL por la política de
-retención de logs, asunto que requiere decisión antes de purgar históricos.
+versionada, incluye preflight de `btree_gist` y conserva `ingestion_log` como
+proveniencia permanente. La base aislada debe contener el esquema base
+bootstrappeado desde `DDL.txt` sin sus sentencias `DROP TABLE`.
 
-**Pruebas ejecutadas:** 47 pruebas offline de ETL, extractores, adaptadores,
-catálogos y persistencia unitaria pasan. No se conectó a la base por defecto.
-No existe configuración de PostgreSQL de pruebas aislada; por tanto, no se
-verificaron migración, constraints reales, transacciones ni idempotencia
-concurrente en PostgreSQL.
+**Pruebas ejecutadas:** 52 pruebas offline pasan. En `ceebi_phase3_test`, el
+bootstrap, la migración y los 8 casos de integración PostgreSQL pasan; también
+pasan las 3 comprobaciones de seguridad del runner.
 
-**Pendiente para cierre de despliegue:** ejecutar la migración y pruebas de
-integración solo en una base aislada, verificar datos duplicados/preflight,
-rollback de una transacción, historial temporal, snapshots de precios,
-idempotencia y ambos extractores. No avanzar a Fase 4 antes de la autorización
-del usuario.
+**Estado:** Fase 3 cerrada y validada en una base aislada. No se inició la
+Fase 4.
 
 ## Fase 4 — Identidad y operación confiable
 

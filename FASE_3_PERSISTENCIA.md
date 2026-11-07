@@ -2,15 +2,16 @@
 
 ## Alcance y estado
 
-Implementación preparada en `refactor/fase-3-persistence`. La Fase 3 separa la
-coordinación de ETL de las escrituras SQL, usa fingerprints por entidad y
-prepara una migración aditiva. No se modificó ni eliminó `PucpETLService`; los
-extractores mantienen su navegación. No se ejecutaron capturas, migraciones ni
-operaciones contra PostgreSQL.
+Implementación en `refactor/fase-3-persistence`. La Fase 3 separa la
+coordinación de ETL de las escrituras SQL y usa fingerprints por entidad. Se
+corrigieron los riesgos de identidad de docentes, catálogos incompletos y
+retención de la proveniencia. No se modificó ni eliminó `PucpETLService`; los
+extractores mantienen su navegación.
 
-La suite offline terminó con **47 pruebas aprobadas**. La aceptación de
-despliegue queda pendiente: no existe una base PostgreSQL aislada configurada
-para probar la migración, integridad temporal y transacciones reales.
+La suite offline tiene **52 pruebas aprobadas**. En PostgreSQL aislado pasaron
+los **8 casos de integración** y las **3 comprobaciones de seguridad** del
+runner. El bootstrap base y la migración se aplicaron en `ceebi_phase3_test`.
+La Fase 3 queda validada; la Fase 4 no se ha iniciado.
 
 ## Arquitectura antes y después
 
@@ -53,8 +54,10 @@ el SQL. No se migró al ORM.
 
 Cada curso se guarda dentro de su propia transacción. Si falla la persistencia,
 esta transacción se revierte y el fallo se registra en cuarentena en una
-transacción separada. Una corrida parcial con cursos en cuarentena no marca
-como inactivos los cursos/ofertas que no fueron observados.
+transacción separada. Una corrida parcial con cursos en cuarentena o paginación
+incompleta no marca como inactivos los cursos/ofertas que no fueron observados.
+El umbral mínimo porcentual no anula la señal `catalog_complete`; la opción
+`limit` también bloquea `mark_missing` cuando recorta el listado.
 
 Los `change_log` siguen siendo auditoría de eventos; no reemplazan las
 fotografías temporales.
@@ -77,17 +80,20 @@ fotografías temporales.
 
 `course_version`, `course_offering_version` y
 `offering_commercial_version` contienen `fingerprint`, atributos JSONB,
-`valid_from`, `valid_to` y `ingestion_id`. Las restricciones de exclusión GIST
-garantizan que no haya intervalos superpuestos por entidad. Los snapshots
-vigentes se cierran y solo se insertan versiones nuevas cuando cambia el
-fingerprint.
+`valid_from`, `valid_to` y `ingestion_id` obligatorio con `ON DELETE RESTRICT`.
+Las restricciones de exclusión GIST garantizan que no haya intervalos
+superpuestos por entidad. Los snapshots vigentes se cierran y solo se insertan
+versiones nuevas cuando cambia el fingerprint.
 
 El historial comercial referencia `price_snapshot`; no vuelve a copiar su
 importe. `price_snapshot`, `offering_price_tier` y `payment_plan` conservan sus
-triggers e historiales existentes. Las referencias de versión a `ingestion_log`
-usan `ON DELETE SET NULL`: las versiones permanecen aunque se purguen logs,
-pero se pierde la asociación a la corrida. Esto requiere resolver la
-incompatibilidad con la retención de 24 meses antes de purgar ejecuciones.
+triggers e historiales existentes. `ingestion_log` conserva indefinidamente la
+fila mínima de proveniencia; un trigger impide eliminarla. Se puede redactar
+`error_msg` y purgar `raw_page` o cuarentenas conforme a su retención, pero no
+borrar corridas ni desvincular versiones.
+
+`OfferingRepository` resuelve docentes mediante `professor_source_link` y
+`source_id`; docentes homónimos de fuentes distintas no se fusionan por nombre.
 
 La identidad busca primero `(source_id, external_id)` y después alias/URL
 canónica. No usa nombre como clave. La migración añade unicidad de URL canónica
@@ -133,13 +139,16 @@ también quedan en los snapshots JSONB.
 - Referencias a corridas para precio, tiers y planes.
 - Restricciones de no solapamiento y soporte de contactos/certificados sin
   precio conocido.
+- Preflight de disponibilidad/permisos de `btree_gist` y protección para que
+  nunca se eliminen las filas de proveniencia de `ingestion_log`.
 
 La migración requiere permiso para instalar `btree_gist`. Debe respaldarse la
-base y probarse en una base aislada antes de desplegar. No se ejecutó ni se
-preparó un rollback destructivo: ante rollback de aplicación se deja el esquema
-aditivo intacto; las tablas de historial no deben eliminarse porque contienen
-datos. `DDL.txt` sigue siendo referencia de esquema y no debe ejecutarse como
-migración.
+base y probarse en una base aislada antes de desplegar. El runner
+`python -m etl.run_phase3_pg_integration` valida el nombre y configura
+exclusivamente `CEEBI_TEST_DB_*`; por defecto el nombre es `ceebi_phase3_test`.
+Solo aplica el DDL base filtrado de sentencias `DROP TABLE` en una base pública
+vacía, y aborta ante un esquema parcial. `DDL.txt` no debe ejecutarse como
+migración sobre una base existente.
 
 ## Archivos de esta fase
 
@@ -147,27 +156,25 @@ migración.
   `etl/services/etl_engine.py`, `etl/test_fase1_baseline.py`,
   `ARCHITECTURE_DECISIONS.md`, `REFACTORING_PLAN.md`.
 - Añadidos: `database/migrations/003_persistence_history.sql`,
-  `etl/test_phase3_persistence.py`, `FASE_3_PERSISTENCIA.md`.
-- Conservado sin cambios: `etl/extractors/pucp.py` y `PucpETLService`.
+  `etl/test_phase3_persistence.py`, `etl/test_phase3_pg_integration.py`,
+  runner/configuración PostgreSQL aislada y `FASE_3_PERSISTENCIA.md`.
+- Modificados los extractores PUCP/Cibertec para comunicar la completitud de
+  paginación. `PucpETLService` se conserva sin cambios.
 
-## Verificación y pendientes
+## Verificación
 
-Se ejecutaron las pruebas Django offline de `etl` y `catalog`: **47/47
-aprobadas**, incluyendo fixtures PUCP/Cibertec y pruebas de huellas,
-observaciones, URL canónica y ausencia/moneda no soportada. No se utilizó la
-base configurada como `default`.
+Se ejecutaron las pruebas Django de `etl` y `catalog`: **52/52 offline
+aprobadas**. Con `python -m etl.run_phase3_pg_integration` pasaron **11/11
+pruebas**: los 8 casos PostgreSQL solicitados y 3 comprobaciones de seguridad
+del runner. Se validaron migración limpia, FK restrictiva y retención de
+ingestas, exclusión temporal, trigger de precio, idempotencia, nuevas versiones
+ante cambios, reconciliación por URL canónica, rollback por curso y separación
+de docentes homónimos. No se utilizó la base `default` de la aplicación.
 
-Antes de considerar desplegable la fase quedan pendientes pruebas en PostgreSQL
-aislado para:
-
-1. Aplicación y revisión de la migración sobre una copia representativa.
-2. Inserción/repetición de una captura, cambios/no-cambios y duplicados por
-   identidad.
-3. Intervalos, trigger de precio, transacción y rollback ante fallos.
-4. Persistencia consultable de docentes, contactos, certificados, descuentos,
-   tiers y planes.
-5. Política de retención que preserve el vínculo entre versiones y ejecuciones.
+La migración se ejecutó solo sobre la base aislada de pruebas; su despliegue en
+una base operativa sigue sujeto a respaldo y procedimiento de despliegue. Esta
+validación no inicia ni implementa la Fase 4.
 
 `PucpETLService` sigue siendo una ruta SQL duplicada no utilizada por los
-comandos actuales; su consolidación queda fuera de esta fase. La Fase 4 no debe
-iniciarse sin autorización y sin cerrar las pruebas de integración pendientes.
+comandos actuales; su consolidación queda fuera de esta fase. La Fase 4 no se
+ha iniciado.

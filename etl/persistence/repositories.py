@@ -301,11 +301,10 @@ class IngestionRepository:
         cursor.execute(
             """
             INSERT INTO course_offering_version
-                (offering_id, ingestion_id, ingestion_id_original, fingerprint,
-                 attributes, valid_from)
-            VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp());
+                (offering_id, ingestion_id, fingerprint, attributes, valid_from)
+            VALUES (%s, %s, %s, %s::jsonb, clock_timestamp());
             """,
-            (offering_id, ingestion_id, ingestion_id, fingerprint, _json(attributes)),
+            (offering_id, ingestion_id, fingerprint, _json(attributes)),
         )
 
     @staticmethod
@@ -340,11 +339,10 @@ class IngestionRepository:
         cursor.execute(
             """
             INSERT INTO course_version
-                (course_id, ingestion_id, ingestion_id_original, fingerprint,
-                 attributes, valid_from)
-            VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp());
+                (course_id, ingestion_id, fingerprint, attributes, valid_from)
+            VALUES (%s, %s, %s, %s::jsonb, clock_timestamp());
             """,
-            (course_id, ingestion_id, ingestion_id, fingerprint, _json(attributes)),
+            (course_id, ingestion_id, fingerprint, _json(attributes)),
         )
 
     @staticmethod
@@ -864,38 +862,32 @@ class OfferingRepository:
         )
         for professor in attributes.get("professors", []):
             cursor.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(lower(%s)));",
-                (professor["full_name"],),
+                "SELECT pg_advisory_xact_lock(%s, hashtext(lower(%s)));",
+                (source_id, professor["full_name"]),
             )
             cursor.execute(
                 """
-                SELECT id FROM professor
-                 WHERE lower(full_name) = lower(%s)
-                 ORDER BY (specialty IS NOT NULL) DESC, id
-                 LIMIT 1 FOR UPDATE;
+                SELECT p.id
+                  FROM professor p
+                  JOIN professor_source_link psl ON psl.professor_id = p.id
+                 WHERE psl.source_id = %s
+                   AND lower(p.full_name) = lower(%s)
+                 ORDER BY (psl.specialty IS NOT NULL) DESC, p.id
+                 LIMIT 1 FOR UPDATE OF p;
                 """,
-                (professor["full_name"],),
+                (source_id, professor["full_name"]),
             )
             row = cursor.fetchone()
             if row:
                 professor_id = row[0]
-                if professor.get("specialty"):
-                    cursor.execute(
-                        """
-                        UPDATE professor
-                           SET specialty = COALESCE(specialty, %s)
-                         WHERE id = %s;
-                        """,
-                        (professor["specialty"], professor_id),
-                    )
             else:
                 cursor.execute(
                     """
-                    INSERT INTO professor (full_name, specialty)
-                    VALUES (%s, %s)
+                    INSERT INTO professor (full_name)
+                    VALUES (%s)
                     RETURNING id;
                     """,
-                    (professor["full_name"], professor.get("specialty")),
+                    (professor["full_name"],),
                 )
                 professor_id = cursor.fetchone()[0]
             cursor.execute(
@@ -1001,7 +993,7 @@ class OfferingRepository:
                 attributes.get("duration_hours"),
                 attributes.get("duration_weeks"),
                 attributes.get("sessions_count"),
-                _fingerprint(attributes),
+                _offering_fingerprint(attributes),
             ),
         )
         row = cursor.fetchone()
@@ -1189,11 +1181,10 @@ class OfferingRepository:
         cursor.execute(
             """
             INSERT INTO course_offering_version
-                (offering_id, ingestion_id, ingestion_id_original, fingerprint,
-                 attributes, valid_from)
-            VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp());
+                (offering_id, ingestion_id, fingerprint, attributes, valid_from)
+            VALUES (%s, %s, %s, %s::jsonb, clock_timestamp());
             """,
-            (offering_id, ingestion_id, ingestion_id, fingerprint, _json(attributes)),
+            (offering_id, ingestion_id, fingerprint, _json(attributes)),
         )
 
     @staticmethod
@@ -1308,13 +1299,12 @@ class OfferingRepository:
         cursor.execute(
             """
             INSERT INTO offering_commercial_version
-                (offering_id, ingestion_id, ingestion_id_original, price_snapshot_id,
-                 fingerprint, attributes, valid_from)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb, clock_timestamp());
+                (offering_id, ingestion_id, price_snapshot_id, fingerprint,
+                 attributes, valid_from)
+            VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp());
             """,
             (
                 offering_id,
-                ingestion_id,
                 ingestion_id,
                 snapshot_id,
                 fingerprint,
@@ -1930,11 +1920,10 @@ class CourseRepository:
         cursor.execute(
             """
             INSERT INTO course_version
-                (course_id, ingestion_id, ingestion_id_original, fingerprint,
-                 attributes, valid_from)
-            VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp());
+                (course_id, ingestion_id, fingerprint, attributes, valid_from)
+            VALUES (%s, %s, %s, %s::jsonb, clock_timestamp());
             """,
-            (course_id, ingestion_id, ingestion_id, fingerprint, _json(attributes)),
+            (course_id, ingestion_id, fingerprint, _json(attributes)),
         )
 
     @staticmethod

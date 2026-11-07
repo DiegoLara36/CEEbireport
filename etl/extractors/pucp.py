@@ -48,6 +48,7 @@ class PucpExtractor(BaseExtractor):
     # 1. EXTRACCIÓN DEL LISTADO PAGINADO (Tu código integrado)
     # =========================================================================
     def fetch_catalog_index(self, sleep_seconds: float = 1.0) -> List[Dict[str, Any]]:
+        self.catalog_complete = False
         html_text, _, _ = self.fetch_page(self.base_url)
         soup = BeautifulSoup(html_text, "html.parser")
 
@@ -57,6 +58,7 @@ class PucpExtractor(BaseExtractor):
 
         resultados = []
         urls_vistas = set()
+        catalog_complete = True
 
         for pagina in range(1, total_paginas + 1):
             if pagina == 1:
@@ -69,6 +71,7 @@ class PucpExtractor(BaseExtractor):
                     pagina_soup = BeautifulSoup(page_html, "html.parser")
                 except requests.RequestException as e:
                     print(f"[PUCP] Error en la página {pagina}: {e}")
+                    catalog_complete = False
                     continue
 
             print(f"[PUCP] Procesando página {pagina}/{total_paginas}")
@@ -109,6 +112,7 @@ class PucpExtractor(BaseExtractor):
             if pagina < total_paginas and sleep_seconds > 0:
                 time_module.sleep(sleep_seconds)
 
+        self.catalog_complete = catalog_complete
         return resultados
 
     # =========================================================================
