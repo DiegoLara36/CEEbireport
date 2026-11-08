@@ -8,8 +8,9 @@ es conservar las capturas funcionales de PUCP y Cibertec.
 
 - `etl/services/etl_engine.py` coordina PUCP y Cibertec, transforma al DTO común,
   ejecuta SQL mediante `django.db.connection` y registra cambios e ingestas.
-- `etl/extractors/pucp.py` usa `requests`/BeautifulSoup y contiene además
-  `PucpETLService`, otra ruta SQL que no invocan los comandos actuales.
+- `etl/extractors/pucp.py` contiene `PucpExtractor`, centrado en extracción y
+  parseo con `requests`/BeautifulSoup. La antigua clase `PucpETLService` de
+  persistencia SQL fue eliminada al cerrar la Fase 4.
 - `etl/extractors/cibertec.py` usa Playwright y construye `ScrapedCourseDTO`.
 - `etl/schemas.py` declara contratos Pydantic específicos y comunes. Desde la
   Fase 2, el DTO común incluye docentes, contactos y estados de observación;
@@ -274,6 +275,8 @@ migración.
 - Cambios de `external_id` se reconcilian por `canonical_url` con alias
   persistente. Si el ID/alias y la URL identifican cursos diferentes, se
   produce una colisión explícita que el motor envía a cuarentena.
+- `PucpETLService` fue eliminado; `PucpExtractor` conserva únicamente la lógica
+  de extracción y transformación.
 - La suite offline completa pasa **58/58** pruebas; el runner PostgreSQL de
   Fases 3/4 pasa **14/14** casos, incluidas las comprobaciones del destino
   aislado.

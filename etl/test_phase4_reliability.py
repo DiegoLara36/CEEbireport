@@ -1,12 +1,14 @@
 from contextlib import nullcontext
 from io import StringIO
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from django.core.management import call_command
 from django.test import SimpleTestCase
 
-from catalog.management.commands.run_ingestion import Command
+from etl.extractors.cibertec import CibertecExtractionError, CibertecExtractor
 from etl.persistence.repositories import (
     CourseRepository,
     IdentityCollisionError,
@@ -16,6 +18,43 @@ from etl.services.etl_engine import ETLEngine
 
 
 class Phase4ReliabilityOfflineTests(SimpleTestCase):
+    def test_playwright_context_uses_notebook_user_agent_and_bounded_timeouts(self):
+        playwright_module = ModuleType("playwright")
+        playwright_module.__path__ = []
+        sync_api_module = ModuleType("playwright.sync_api")
+        sync_api_module.TimeoutError = TimeoutError
+        runtime = Mock()
+        browser = Mock()
+        context = Mock()
+        page = Mock()
+        runtime.chromium.launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = page
+        manager = Mock()
+        manager.start.return_value = runtime
+        sync_api_module.sync_playwright = Mock(return_value=manager)
+        playwright_module.sync_api = sync_api_module
+        extractor = CibertecExtractor(timeout=3)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "playwright": playwright_module,
+                "playwright.sync_api": sync_api_module,
+            },
+        ):
+            extractor.start()
+
+        runtime.chromium.launch.assert_called_once_with(
+            headless=True, timeout=3000
+        )
+        self.assertIn("Chrome/120.0.0.0", browser.new_context.call_args.kwargs["user_agent"])
+        page.set_default_timeout.assert_called_once_with(3000)
+        page.set_default_navigation_timeout.assert_called_once_with(3000)
+        extractor.close()
+        browser.close.assert_called_once_with()
+        runtime.stop.assert_called_once_with()
+
     def test_external_id_and_canonical_url_collision_is_rejected(self):
         cursor = Mock()
         cursor.fetchone.side_effect = [
@@ -92,6 +131,50 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
         engine.extractor.fetch_catalog_index.assert_not_called()
         engine.ingestion_repository.release_source_lock.assert_not_called()
 
+    def test_critical_cibertec_initialization_failure_marks_run_failed_and_releases_lock(
+        self,
+    ):
+        engine = ETLEngine("CIBERTEC")
+        engine.ensure_sources = Mock()
+        engine.ingestion_repository.source_id = Mock(return_value=7)
+        engine.ingestion_repository.try_source_lock = Mock(return_value=True)
+        engine.ingestion_repository.recover_abandoned = Mock(return_value=[])
+        engine.ingestion_repository.release_source_lock = Mock(return_value=True)
+        engine._start_ingestion = Mock(return_value=(7, 8))
+        engine._active_course_count = Mock(return_value=1)
+        engine.extractor.start = Mock(
+            side_effect=CibertecExtractionError(
+                "Timeout (30000 ms) al iniciar Chromium para Cibertec."
+            )
+        )
+        engine._finish_ingestion = Mock()
+        engine._purge_retained_data = Mock()
+        engine.resilience.failed = Mock()
+        cursor = Mock()
+
+        with (
+            patch(
+                "etl.services.etl_engine.connection",
+                SimpleNamespace(cursor=Mock(return_value=nullcontext(cursor))),
+            ),
+            patch(
+                "etl.services.etl_engine.transaction.atomic",
+                return_value=nullcontext(),
+            ),
+        ):
+            result = engine.run()
+
+        self.assertEqual(result["status"], "FAILED")
+        engine.extractor.start.assert_called_once_with()
+        engine._finish_ingestion.assert_called_once()
+        self.assertEqual(
+            engine._finish_ingestion.call_args.args[2],
+            "FAILED",
+        )
+        engine.ingestion_repository.release_source_lock.assert_called_once_with(
+            cursor, 7
+        )
+
     def test_scheduled_engine_rechecks_next_run_after_lock_acquisition(self):
         engine = ETLEngine("PUCP")
         engine.ensure_sources = Mock()
@@ -126,12 +209,16 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
         self.assertIn("status = 'RUNNING'", cursor.execute.call_args.args[0])
 
     def test_command_preserves_scheduled_and_forced_run_modes(self):
-        for force in (False, True):
-            with self.subTest(force=force):
-                command = Command()
-                command.stdout = StringIO()
+        cases = (
+            (None, False),
+            (None, True),
+            ("PUCP", True),
+            ("CIBERTEC", True),
+        )
+        for source, force in cases:
+            with self.subTest(source=source, force=force):
                 cursor = Mock()
-                cursor.fetchall.return_value = [("PUCP",)]
+                cursor.fetchall.return_value = [(source or "PUCP",)]
                 with (
                     patch(
                         "catalog.management.commands.run_ingestion.connection",
@@ -164,8 +251,14 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
                         "processed_ok": 1,
                         "quarantined": 0,
                     }
-                    command.handle(source=None, force=force)
+                    arguments = []
+                    if source:
+                        arguments.extend(["--source", source])
+                    if force:
+                        arguments.append("--force")
+                    call_command("run_ingestion", *arguments, stdout=StringIO())
 
+                engine_class.assert_called_once_with(source or "PUCP")
                 engine_class.return_value.run.assert_called_once_with(
                     respect_schedule=not force
                 )

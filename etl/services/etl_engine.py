@@ -9,7 +9,7 @@ from django.db import connection, transaction
 from django.utils import timezone
 from pydantic import ValidationError
 
-from etl.extractors.cibertec import CibertecExtractor
+from etl.extractors.cibertec import CibertecExtractionError, CibertecExtractor
 from etl.extractors.pucp import PucpExtractor
 from etl.persistence.repositories import CourseRepository, IngestionRepository
 from etl.schemas import ScrapedCourseDTO, pucp_course_to_dto
@@ -122,6 +122,8 @@ class ETLEngine:
                         changes = self._persist_course(
                             cursor, source_id, ingestion_id, dto
                         )
+                except CibertecExtractionError as exc:
+                    raise IngestionFailure(str(exc), "HTTP_ERROR") from exc
                 except (ValidationError, ValueError) as exc:
                     counts["quarantined"] += 1
                     self._quarantine(source_id, ingestion_id, item, exc)

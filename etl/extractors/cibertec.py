@@ -20,6 +20,10 @@ from etl.adapters import adapt_cibertec_course
 from etl.normalization import normalize_amount, normalize_currency
 
 
+class CibertecExtractionError(RuntimeError):
+    """Raised when Playwright cannot load or advance a Cibertec page in time."""
+
+
 MONTHS_ES = {
     "ene": 1, "enero": 1, "feb": 2, "febrero": 2, "mar": 3, "marzo": 3,
     "abr": 4, "abril": 4, "may": 5, "mayo": 5, "jun": 6, "junio": 6,
@@ -112,9 +116,17 @@ class CibertecExtractor:
     source_code = "CIBERTEC"
     source_name = "Educación Continua Cibertec"
     base_url = "https://educacioncontinua.cibertec.edu.pe/buscador/"
+    MAX_CATALOG_PAGES = 100
+    CATALOG_SELECTOR_TIMEOUT_MS = 15_000
+    DETAIL_SELECTOR_TIMEOUT_MS = 10_000
+    PAGINATION_TIMEOUT_MS = 5_000
+    INTERACTION_SETTLE_MS = 300
 
     def __init__(self, timeout: int = 30):
+        if timeout <= 0:
+            raise ValueError("El timeout de Cibertec debe ser mayor que cero.")
         self.timeout = timeout
+        self.timeout_ms = timeout * 1000
         self.raw_pages: list[tuple[str, bytes]] = []
         self.catalog_complete = False
         self._playwright = None
@@ -136,46 +148,124 @@ class CibertecExtractor:
                 "'playwright install chromium'."
             ) from exc
         self._playwright_timeout_error = PlaywrightTimeoutError
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
-        context = self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        try:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(
+                headless=True, timeout=self.timeout_ms
             )
-        )
-        self._page = context.new_page()
-        self._page.set_default_timeout(self.timeout * 1000)
+            context = self._browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            )
+            self._page = context.new_page()
+            self._page.set_default_timeout(self.timeout_ms)
+            self._page.set_default_navigation_timeout(self.timeout_ms)
+        except self._playwright_timeout_error as exc:
+            self.close()
+            raise CibertecExtractionError(
+                f"Timeout ({self.timeout}s) al iniciar Chromium para Cibertec."
+            ) from exc
+        except Exception as exc:
+            self.close()
+            raise CibertecExtractionError(
+                f"No se pudo inicializar Playwright para Cibertec: {exc}"
+            ) from exc
 
     def close(self) -> None:
-        if self._browser:
-            self._browser.close()
-        if self._playwright:
-            self._playwright.stop()
-        self._page = self._browser = self._playwright = None
+        browser, playwright = self._browser, self._playwright
+        try:
+            if browser:
+                browser.close()
+        finally:
+            try:
+                if playwright:
+                    playwright.stop()
+            finally:
+                self._page = self._browser = self._playwright = None
+
+    def _navigate(self, url: str):
+        try:
+            response = self._page.goto(
+                url, wait_until="networkidle", timeout=self.timeout_ms
+            )
+        except self._playwright_timeout_error as exc:
+            raise CibertecExtractionError(
+                f"Timeout ({self.timeout}s) cargando la página Cibertec: {url}"
+            ) from exc
+        if response and response.status >= 400:
+            raise requests.HTTPError(f"HTTP {response.status} al cargar {url}")
+        return response
+
+    def _wait_for_selector(
+        self, selector: str, *, url: str, maximum_timeout_ms: int
+    ) -> None:
+        timeout_ms = min(self.timeout_ms, maximum_timeout_ms)
+        try:
+            self._page.wait_for_selector(selector, timeout=timeout_ms)
+        except self._playwright_timeout_error as exc:
+            raise CibertecExtractionError(
+                f"Timeout ({timeout_ms} ms) esperando el selector {selector!r} "
+                f"en {url}."
+            ) from exc
+
+    @staticmethod
+    def _pagination_state(soup: BeautifulSoup) -> tuple[int, int] | None:
+        for node in soup.select("#catalog-cursos div"):
+            match = re.fullmatch(
+                r"\s*(\d+)\s*/\s*(\d+)\s*", node.get_text(" ", strip=True)
+            )
+            if match:
+                current, total = map(int, match.groups())
+                if 1 <= current <= total:
+                    return current, total
+        return None
 
     def fetch_catalog_index(self) -> list[dict[str, Any]]:
         self.catalog_complete = False
         self.start()
-        response = self._page.goto(
-            self.base_url, wait_until="networkidle", timeout=self.timeout * 1000
-        )
-        if response and response.status >= 400:
-            raise requests.HTTPError(f"HTTP {response.status} al cargar el catálogo Cibertec")
+        self._navigate(self.base_url)
         try:
             self._page.wait_for_selector(
-                "#catalog-cursos article", timeout=self.timeout * 1000
+                "#catalog-cursos article",
+                timeout=min(self.timeout_ms, self.CATALOG_SELECTOR_TIMEOUT_MS),
             )
-        except self._playwright_timeout_error:
+        except self._playwright_timeout_error as exc:
             self.raw_pages.append((self._page.url, self._page.content().encode("utf-8")))
-            return []
+            raise CibertecExtractionError(
+                f"No apareció #catalog-cursos article en {self.base_url} "
+                f"tras {min(self.timeout_ms, self.CATALOG_SELECTOR_TIMEOUT_MS)} ms."
+            ) from exc
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
+        page_number = 1
+        total_pages = None
         while True:
+            if page_number > self.MAX_CATALOG_PAGES:
+                raise CibertecExtractionError(
+                    f"La paginación de Cibertec superó el límite de "
+                    f"{self.MAX_CATALOG_PAGES} páginas."
+                )
             html = self._page.content()
             self.raw_pages.append((self._page.url, html.encode("utf-8")))
             soup = BeautifulSoup(html, "html.parser")
-            cards = soup.select("#catalog-cursos article") or soup.select("article")
+            pagination = self._pagination_state(soup)
+            if pagination:
+                reported_page, reported_total = pagination
+                if total_pages is None:
+                    total_pages = reported_total
+                elif total_pages != reported_total:
+                    raise CibertecExtractionError(
+                        "El total de páginas del catálogo Cibertec cambió durante "
+                        "la extracción."
+                    )
+                if reported_page != page_number:
+                    raise CibertecExtractionError(
+                        f"Se esperaba la página {page_number} del catálogo, pero "
+                        f"Cibertec indicó {reported_page}/{reported_total}."
+                    )
+            cards = soup.select("#catalog-cursos article")
             for card in cards:
                 title_node = card.select_one("h3")
                 more_label = card.find(string=re.compile(r"Saber\s+m[aá]s", re.I))
@@ -227,79 +317,139 @@ class CibertecExtractor:
                 })
 
             next_button = self._page.locator(
-                "button[aria-label='Ver cursos posteriores'], "
-                "button[aria-label*='Siguiente'], button:has-text('Siguiente'), "
-                "a[aria-label*='Siguiente']"
+                'button[aria-label="Ver cursos posteriores"], '
+                'button[aria-label*="Siguiente"], button:has-text("Siguiente"), '
+                'a[aria-label*="Siguiente"]'
             ).first
-            if next_button.count() == 0 or next_button.is_disabled():
-                self.catalog_complete = True
-                break
-            previous_title = (
-                self._page.locator("#catalog-cursos article h3").first.inner_text().strip()
-            )
             try:
-                next_button.click()
+                if next_button.count() == 0 or next_button.is_disabled():
+                    if total_pages is not None and page_number < total_pages:
+                        raise CibertecExtractionError(
+                            f"El control de paginación desapareció antes de la "
+                            f"página {total_pages}."
+                        )
+                    self.catalog_complete = True
+                    break
+                if total_pages is not None and page_number >= total_pages:
+                    self.catalog_complete = True
+                    break
+                first_card = soup.select_one("#catalog-cursos article")
+                first_title = first_card.select_one("h3") if first_card else None
+                first_link = first_card.select_one("a[href]") if first_card else None
+                previous = {
+                    "title": first_title.get_text(" ", strip=True) if first_title else "",
+                    "href": (
+                        urljoin(self.base_url, first_link.get("href", ""))
+                        if first_link
+                        else ""
+                    ),
+                    "page": page_number + 1 if total_pages is not None else None,
+                }
+                next_button.click(timeout=self.timeout_ms)
                 self._page.wait_for_function(
                     """previous => {
-                        const title = document.querySelector('#catalog-cursos article h3');
-                        return title && title.innerText.trim() !== previous;
+                        const card = document.querySelector('#catalog-cursos article');
+                        const title = card && card.querySelector('h3');
+                        const link = card && card.querySelector('a[href]');
+                        if (previous.page !== null) {
+                            const marker = [...document.querySelectorAll('#catalog-cursos div')]
+                                .map(node => node.innerText.trim())
+                                .map(text => text.match(/^(\\d+)\\s*\\/\\s*(\\d+)$/))
+                                .find(Boolean);
+                            if (marker && Number(marker[1]) === previous.page) return true;
+                        }
+                        return Boolean(
+                            (title && title.innerText.trim() !== previous.title) ||
+                            (link && link.href !== previous.href)
+                        );
                     }""",
-                    arg=previous_title,
-                    timeout=min(self.timeout * 1000, 10000),
+                    arg=previous,
+                    timeout=min(self.timeout_ms, self.PAGINATION_TIMEOUT_MS),
                 )
-            except self._playwright_timeout_error:
-                break
+            except CibertecExtractionError:
+                raise
+            except self._playwright_timeout_error as exc:
+                raise CibertecExtractionError(
+                    f"Timeout ({min(self.timeout_ms, self.PAGINATION_TIMEOUT_MS)} ms) "
+                    f"al avanzar desde la página {page_number} del catálogo Cibertec."
+                ) from exc
+            page_number += 1
         return results
 
     def fetch_course(self, item: dict[str, Any]) -> tuple[ScrapedCourseDTO, str, bytes]:
         self.start()
         url = item["url"]
-        response = self._page.goto(url, wait_until="networkidle", timeout=self.timeout * 1000)
-        if response and response.status >= 400:
-            raise requests.HTTPError(f"HTTP {response.status} al cargar {url}")
-        self._page.wait_for_selector("nav[aria-label='Breadcrumb'], h1", timeout=self.timeout * 1000)
-        modules: list[dict[str, Any]] = []
-        buttons = self._page.locator("button:has-text('Módulo')")
-        for index in range(buttons.count()):
-            button = buttons.nth(index)
-            module_name = button.inner_text().strip()
-            button.click()
-            self._page.wait_for_timeout(200)
-            soup_module = BeautifulSoup(
-                self._page.locator("div.border-base-color-secondary-60:has(h3)").first.inner_html(),
-                "html.parser",
+        try:
+            self._navigate(url)
+            self._wait_for_selector(
+                "nav[aria-label='Breadcrumb'], h1",
+                url=url,
+                maximum_timeout_ms=self.DETAIL_SELECTOR_TIMEOUT_MS,
             )
-            header = soup_module.find("h3")
-            modules.append({
-                "name": header.get_text(" ", strip=True) if header else module_name,
-                "items": [li.get_text(" ", strip=True) for li in soup_module.find_all("li")],
-            })
+            modules: list[dict[str, Any]] = []
+            buttons = self._page.locator("button:has-text('Módulo')")
+            for index in range(buttons.count()):
+                button = buttons.nth(index)
+                module_name = button.inner_text().strip()
+                button.click(timeout=self.timeout_ms)
+                self._page.wait_for_timeout(self.INTERACTION_SETTLE_MS)
+                soup_module = BeautifulSoup(
+                    self._page.locator(
+                        "div.border-base-color-secondary-60:has(h3)"
+                    ).first.inner_html(),
+                    "html.parser",
+                )
+                header = soup_module.find("h3")
+                modules.append({
+                    "name": header.get_text(" ", strip=True) if header else module_name,
+                    "items": [li.get_text(" ", strip=True) for li in soup_module.find_all("li")],
+                })
 
-        cohorts: list[dict[str, Any]] = []
-        date_labels = self._page.locator("div.grid label:has(span)")
-        for index in range(date_labels.count()):
-            label = date_labels.nth(index)
-            start_text = label.locator("span").inner_text().strip()
-            label.click()
-            self._page.wait_for_timeout(250)
-            soup = BeautifulSoup(self._page.content(), "html.parser")
-            duration_node = soup.find(string=re.compile(r"\bsemanas?\b|\bhrs?\.?\b", re.IGNORECASE))
-            schedule_node = soup.find(string=re.compile(rf"(?:{WEEKDAY_PATTERN}).*{RANGE_PATTERN.pattern}", re.I))
-            duration_text = duration_node.parent.get_text(" ", strip=True) if duration_node and duration_node.parent else None
-            schedule_text = schedule_node.parent.get_text(" ", strip=True) if schedule_node and schedule_node.parent else None
-            cohorts.append({
-                "start_text": start_text,
-                "duration_text": duration_text,
-                "schedule_text": schedule_text,
-            })
+            cohorts: list[dict[str, Any]] = []
+            date_labels = self._page.locator("div.grid label:has(span)")
+            for index in range(date_labels.count()):
+                label = date_labels.nth(index)
+                start_text = label.locator("span").inner_text().strip()
+                label.click(timeout=self.timeout_ms)
+                self._page.wait_for_timeout(self.INTERACTION_SETTLE_MS)
+                soup = BeautifulSoup(self._page.content(), "html.parser")
+                duration_node = soup.find(
+                    string=re.compile(r"\bsemanas?\b|\bhrs?\.?\b", re.IGNORECASE)
+                )
+                schedule_node = soup.find(
+                    string=re.compile(
+                        rf"(?:{WEEKDAY_PATTERN}).*{RANGE_PATTERN.pattern}", re.I
+                    )
+                )
+                duration_text = (
+                    duration_node.parent.get_text(" ", strip=True)
+                    if duration_node and duration_node.parent
+                    else None
+                )
+                schedule_text = (
+                    schedule_node.parent.get_text(" ", strip=True)
+                    if schedule_node and schedule_node.parent
+                    else None
+                )
+                cohorts.append({
+                    "start_text": start_text,
+                    "duration_text": duration_text,
+                    "schedule_text": schedule_text,
+                })
 
-        html = self._page.content()
-        html_bytes = html.encode("utf-8")
-        self.raw_pages.append((url, html_bytes))
-        data = self.parse_course_detail(
-            html, url, item.get("categoria"), modules, cohorts, item
-        )
-        return data, url, html_bytes
+            html = self._page.content()
+            html_bytes = html.encode("utf-8")
+            self.raw_pages.append((url, html_bytes))
+            data = self.parse_course_detail(
+                html, url, item.get("categoria"), modules, cohorts, item
+            )
+            return data, url, html_bytes
+        except CibertecExtractionError:
+            raise
+        except self._playwright_timeout_error as exc:
+            raise CibertecExtractionError(
+                f"Timeout ({self.timeout}s) extrayendo el detalle Cibertec: {url}"
+            ) from exc
 
     def parse_course_detail(
         self,

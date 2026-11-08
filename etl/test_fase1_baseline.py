@@ -9,7 +9,7 @@ import requests
 from django.test import SimpleTestCase
 from pydantic import ValidationError
 
-from etl.extractors.cibertec import CibertecExtractor
+from etl.extractors.cibertec import CibertecExtractionError, CibertecExtractor
 from etl.extractors.pucp import PucpExtractor
 from etl.persistence.repositories import PriceRepository
 from etl.schemas import (
@@ -219,6 +219,22 @@ class PucpFixtureBaselineTests(SimpleTestCase):
 
 
 class CibertecFixtureBaselineTests(SimpleTestCase):
+    def test_timeout_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "mayor que cero"):
+            CibertecExtractor(timeout=0)
+
+    def test_catalog_navigation_timeout_raises_with_url_context(self):
+        extractor = CibertecExtractor(timeout=1)
+        page = Mock()
+        page.goto.side_effect = TimeoutError("fixture navigation timeout")
+        extractor._page = page
+
+        with (
+            patch.object(extractor, "start"),
+            self.assertRaisesRegex(CibertecExtractionError, "buscador"),
+        ):
+            extractor.fetch_catalog_index()
+
     def test_catalog_extraction_parses_fixture_without_browser_or_network(self):
         html = fixture_text("cibertec_catalog.html")
         extractor = CibertecExtractor()
@@ -242,7 +258,7 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         self.assertEqual(len(extractor.raw_pages), 1)
         self.assertTrue(extractor.catalog_complete)
 
-    def test_catalog_selector_timeout_returns_empty_and_keeps_raw_html(self):
+    def test_catalog_selector_timeout_raises_and_keeps_raw_html(self):
         html = fixture_text("cibertec_catalog.html")
         extractor = CibertecExtractor()
         page = Mock()
@@ -253,9 +269,11 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         extractor._page = page
 
         with patch.object(extractor, "start"):
-            courses = extractor.fetch_catalog_index()
+            with self.assertRaisesRegex(
+                CibertecExtractionError, "#catalog-cursos article"
+            ):
+                extractor.fetch_catalog_index()
 
-        self.assertEqual(courses, [])
         self.assertEqual(extractor.raw_pages, [(extractor.base_url, html.encode("utf-8"))])
         self.assertFalse(extractor.catalog_complete)
 
@@ -272,13 +290,10 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         next_button.first = next_button
         next_button.count.return_value = 1
         next_button.is_disabled.return_value = False
-        heading = Mock()
-        heading.first = heading
-        heading.inner_text.return_value = "Actualización en Analítica"
         no_next_button = Mock()
         no_next_button.first = no_next_button
         no_next_button.count.return_value = 0
-        page.locator.side_effect = [next_button, heading, no_next_button]
+        page.locator.side_effect = [next_button, no_next_button]
         extractor._page = page
 
         with patch.object(extractor, "start"):
@@ -288,12 +303,12 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
             [course["curso"] for course in courses],
             ["Actualización en Analítica", "Power BI Avanzado", "SQL para Analítica"],
         )
-        next_button.click.assert_called_once_with()
+        next_button.click.assert_called_once_with(timeout=extractor.timeout_ms)
         page.wait_for_function.assert_called_once()
         self.assertEqual(len(extractor.raw_pages), 2)
         self.assertTrue(extractor.catalog_complete)
 
-    def test_catalog_pagination_timeout_is_reported_as_incomplete(self):
+    def test_catalog_pagination_timeout_raises_instead_of_returning_partial_data(self):
         first_html = fixture_text("cibertec_catalog.html")
         extractor = CibertecExtractor(timeout=1)
         page = Mock()
@@ -304,17 +319,14 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         next_button.first = next_button
         next_button.count.return_value = 1
         next_button.is_disabled.return_value = False
-        heading = Mock()
-        heading.first = heading
-        heading.inner_text.return_value = "Actualización en Analítica"
-        page.locator.side_effect = [next_button, heading]
+        page.locator.side_effect = [next_button]
         page.wait_for_function.side_effect = TimeoutError("pagination timeout")
         extractor._page = page
 
         with patch.object(extractor, "start"):
-            courses = extractor.fetch_catalog_index()
+            with self.assertRaisesRegex(CibertecExtractionError, "Timeout.*avanzar"):
+                extractor.fetch_catalog_index()
 
-        self.assertEqual(len(courses), 2)
         self.assertFalse(extractor.catalog_complete)
 
     def test_detail_parser_maps_fixture_content_cohort_and_commercial_fields(self):
