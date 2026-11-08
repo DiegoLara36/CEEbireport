@@ -1,8 +1,10 @@
 from django.core.management.base import BaseCommand, CommandError
-from django.db import connection
+from django.db import connection, transaction
 from django.utils import timezone
 
+from etl.persistence.repositories import IngestionRepository
 from etl.services.etl_engine import ETLEngine
+from etl.services.resilience_service import read_settings
 
 
 class Command(BaseCommand):
@@ -27,7 +29,8 @@ class Command(BaseCommand):
         ETLEngine.ensure_sources(
             [source_code] if source_code else ["PUCP", "CIBERTEC"]
         )
-        with connection.cursor() as cursor:
+        with transaction.atomic(), connection.cursor() as cursor:
+            IngestionRepository.purge_retained_data(cursor, read_settings(cursor))
             if source_code:
                 cursor.execute(
                     """
@@ -59,9 +62,19 @@ class Command(BaseCommand):
 
         for code in sources:
             self.stdout.write(f"Iniciando ingesta de {code}...")
-            result = ETLEngine(code).run()
+            result = ETLEngine(code).run(respect_schedule=not force)
             status = result.get("status", "UNKNOWN")
+            if status == "SKIPPED":
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"{code}: omitida ({result.get('skip_reason', 'UNKNOWN')})."
+                    )
+                )
+                continue
+            quality_status = result.get("quality_status")
+            quality_label = f" ({quality_status})" if quality_status else ""
             self.stdout.write(
-                f"{code}: {status}; descubiertos={result['discovered']}, "
+                f"{code}: {status}{quality_label}; "
+                f"descubiertos={result['discovered']}, "
                 f"procesados={result['processed_ok']}, cuarentena={result['quarantined']}."
             )

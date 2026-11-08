@@ -52,10 +52,13 @@ def prepare_database(config: dict[str, str]) -> None:
                 f"no se aplicará DDL parcialmente. Faltan: {missing}"
             )
 
-        migration = (
-            PROJECT_ROOT / "database" / "migrations" / "003_persistence_history.sql"
-        ).read_text(encoding="utf-8")
-        execute_script(conn, migration)
+        migrations = sorted(
+            (PROJECT_ROOT / "database" / "migrations").glob("[0-9][0-9][0-9]_*.sql")
+        )
+        if not migrations or migrations[-1].name != "004_reliability.sql":
+            raise RuntimeError("No se encontró la migración de fiabilidad 004.")
+        for migration_path in migrations:
+            execute_script(conn, migration_path.read_text(encoding="utf-8"))
 
 
 def main() -> int:
@@ -69,15 +72,19 @@ def main() -> int:
     import os
 
     os.environ["CEEBI_RUN_PHASE3_PG_TESTS"] = "1"
+    os.environ["CEEBI_RUN_PHASE4_PG_TESTS"] = "1"
     os.environ["DJANGO_SETTINGS_MODULE"] = "ceebireport.phase3_test_settings"
     import django
 
     django.setup()
 
-    from etl import test_phase3_pg_integration
+    from etl import test_phase3_pg_integration, test_phase4_pg_integration
 
-    suite = unittest.defaultTestLoader.loadTestsFromModule(
-        test_phase3_pg_integration
+    suite = unittest.TestSuite(
+        [
+            unittest.defaultTestLoader.loadTestsFromModule(test_phase3_pg_integration),
+            unittest.defaultTestLoader.loadTestsFromModule(test_phase4_pg_integration),
+        ]
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1

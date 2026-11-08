@@ -1,7 +1,7 @@
 # CEEBI: plan incremental de refactorización
 
-Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. Las Fases 1, 2 y
-3 están implementadas y validadas; la Fase 4 no se ha iniciado.
+Este plan aplica las decisiones de `ARCHITECTURE_DECISIONS.md`. Las Fases 1 a 4
+están implementadas y validadas.
 
 ## Orden y dependencias
 
@@ -15,8 +15,7 @@ Fase 1 Línea base (completada)
   → Fase 7 Metabase embedding (tras validar instancia/licencia)
 ```
 
-La Fase 5 puede prepararse en paralelo con la Fase 4 una vez fijados los
-contratos de datos y la granularidad de las tablas versionadas. La Fase 6 no es
+La Fase 5 puede iniciarse una vez aprobado su alcance. La Fase 6 no es
 prerrequisito para Metabase: Metabase leerá `bi`, no el ORM.
 
 ## Fase 1 — Línea base funcional (completada)
@@ -158,8 +157,21 @@ captura por scheduler y ejecución manual, liberar locks ante terminación abrup
 de una fuente producen un único ganador; fuentes distintas pueden correr según
 política; fallo/interrupción queda detectable; reintento no duplica filas.
 
-**Termina cuando:** captura diaria revisa fechas, selección manual sigue
-funcionando y la exclusión/recovery está verificada en PostgreSQL de prueba.
+**Implementación Fase 4:** la migración `004_reliability.sql` adopta los estados
+`RUNNING`, `COMPLETED`, `FAILED` y `ABANDONED`, agrega la resolución fechada de
+cuarentenas y registra valores iniciales de retención. `ETLEngine` mantiene un
+advisory lock de sesión por fuente, recupera corridas huérfanas al obtenerlo y
+revalida `next_run_at` en ejecuciones programadas. La identidad compara el
+candidato externo/alias con la URL canónica; conflictos entre cursos se
+rechazan y siguen la ruta normal de cuarentena. La tarea de Windows está
+documentada en `FASE_4_OPERACION.md`.
+
+**Validación:** pruebas offline y suites PostgreSQL de Fases 3/4 ejecutadas
+correctamente en la base aislada. El runner prueba competencia por lock,
+liberación al cerrar la sesión, recuperación de corridas abandonadas y
+retención sin borrar proveniencia histórica.
+
+**Estado:** Fase 4 implementada y validada. No se inició la Fase 5.
 
 ## Fase 5 — Vistas `bi` y usuario de lectura
 

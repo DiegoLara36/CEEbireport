@@ -400,6 +400,10 @@ class EtlEnginePureLogicBaselineTests(SimpleTestCase):
         engine.extractor.fetch_catalog_index.return_value = [{"url": "https://example.test/course"}]
         engine.extractor.catalog_complete = False
         engine._start_ingestion = Mock(return_value=(1, 2))
+        engine.ingestion_repository.source_id = Mock(return_value=1)
+        engine.ingestion_repository.try_source_lock = Mock(return_value=True)
+        engine.ingestion_repository.recover_abandoned = Mock(return_value=[])
+        engine.ingestion_repository.release_source_lock = Mock(return_value=True)
         engine._active_course_count = Mock(return_value=1)
         engine._extract_one = Mock(return_value=ScrapedCourseDTO(
             source_code="PUCP",
@@ -415,7 +419,7 @@ class EtlEnginePureLogicBaselineTests(SimpleTestCase):
         engine._minimum_courses_pct = Mock(return_value=20)
         engine._mark_missing = Mock()
         engine._finish_ingestion = Mock()
-        engine._purge_raw_pages = Mock()
+        engine._purge_retained_data = Mock()
         engine.resilience.succeeded = Mock()
         engine.ensure_sources = Mock()
         cursor = Mock()
@@ -430,7 +434,8 @@ class EtlEnginePureLogicBaselineTests(SimpleTestCase):
             result = engine.run()
 
         engine._mark_missing.assert_not_called()
-        self.assertEqual(result["status"], "PARTIAL")
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(result["quality_status"], "PARTIAL")
         self.assertFalse(result["catalog_complete"])
 
     def test_unchanged_price_reuses_current_snapshot(self):

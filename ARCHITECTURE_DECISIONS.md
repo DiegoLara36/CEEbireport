@@ -67,6 +67,10 @@ permiten reconciliar un identificador externo nuevo con una URL canónica ya
 conocida. La identidad sigue sin basarse en el nombre. La unicidad de URL es
 por fuente y solo aplica a valores no nulos.
 
+Fase 4 valida que la identidad externa/alias y la URL canónica no apunten a
+cursos distintos. Una colisión se envía al flujo de cuarentena, mientras que
+un ID externo nuevo con URL conocida se registra como alias auditable.
+
 ### ADR-03 — Homologación
 
 La equivalencia entre cursos de distintas instituciones se administrará
@@ -135,6 +139,13 @@ captura incompleta/abandonada y una política de recuperación. El servidor web
 no inicia ETL al atender solicitudes. No añadir Celery ni otro orquestador
 hasta que exista necesidad operacional demostrable.
 
+Implementación Fase 4: `ETLEngine` usa un advisory lock de sesión por
+`source_id`; PostgreSQL lo libera al cerrarse la sesión. Al adquirirlo, la
+corrida convierte los `RUNNING` remanentes a `ABANDONED`. Las ejecuciones
+programadas vuelven a validar `next_run_at` dentro del lock; `--force` sigue
+siendo explícito y manual. Los estados de ciclo de vida son independientes del
+resultado de calidad `OK`/`PARTIAL`, guardado en `counts`.
+
 ### ADR-08 — Retención
 
 Política inicial, configurable y aplicada solo tras definir resolución y
@@ -143,7 +154,8 @@ auditoría:
 | Datos | Retención inicial |
 |---|---:|
 | Versiones normalizadas de cursos, ofertas y precios | Indefinida |
-| Registros de ejecuciones ETL | 24 meses |
+| Registro mínimo de ejecuciones ETL | Indefinida |
+| Payload (`counts`) y texto diagnóstico (`error_msg`) de ejecuciones | 24 meses |
 | HTML y datos crudos de extracción | 90 días |
 | Cuarentenas | 90 días después de su resolución |
 
@@ -153,9 +165,15 @@ No ejecutar limpieza automática del historial normalizado. Hoy
 `ingestion_log`. Para cumplir los 90 días de datos crudos también habrá que revisar
 `raw_payload` que esté embebido en snapshots u otros registros históricos:
 conservar los valores normalizados indefinidamente no implica conservar el
-HTML o payload original indefinidamente. Para retener cuarentenas desde su
-resolución se necesita definir y persistir cuándo se resuelve/revisa cada
-registro.
+HTML o payload original indefinidamente. La migración 004 conserva los
+diagnósticos mínimos de corrida y añade `resolved`/`resolved_at` para aplicar
+la retención de cuarentenas sin confundir su resolución con una mera revisión.
+
+Implementación Fase 4: la tarea aplica las retenciones configurables
+`retention_raw_page_days`, `retention_resolved_quarantine_days` y
+`retention_ingestion_diagnostic_months`. Limpia `ingestion_log.counts` y
+`error_msg` sin eliminar las filas ni sus claves de proveniencia. `resolved_at`
+se asigna mediante trigger al marcar una cuarentena como resuelta.
 
 ### ADR-09 — Monedas
 
@@ -241,6 +259,26 @@ de cuarentena y configuración de retenciones; rol de lectura de Metabase.
 Aplicar todo solo mediante migraciones aditivas revisadas y probadas sobre una
 copia representativa, nunca ejecutando directamente el DDL destructivo como
 migración.
+
+## Estado de implementación al cierre de la Fase 4
+
+- `database/migrations/004_reliability.sql` amplía el ciclo de vida de
+  `ingestion_log` y agrega la marca auditable de resolución y los defaults de
+  retención.
+- `ETLEngine` obtiene un advisory lock de sesión por `source_id` antes de
+  capturar la fuente, reporta conflictos sin solapar trabajos, recupera filas
+  `RUNNING` abandonadas y libera el lock normalmente en `finally`.
+- El comando diario vuelve a revisar `next_run_at` dentro del lock; la purga
+  corre aunque no haya fuentes vencidas. `--source` y `--force` mantienen su
+  semántica manual.
+- Cambios de `external_id` se reconcilian por `canonical_url` con alias
+  persistente. Si el ID/alias y la URL identifican cursos diferentes, se
+  produce una colisión explícita que el motor envía a cuarentena.
+- La suite offline completa pasa **58/58** pruebas; el runner PostgreSQL de
+  Fases 3/4 pasa **14/14** casos, incluidas las comprobaciones del destino
+  aislado.
+- La configuración recomendada del Programador de tareas y los comandos
+  operativos están en `FASE_4_OPERACION.md`. La Fase 5 no se inició.
 
 **Exigen pruebas antes de habilitar:** igualdad de mapeo PUCP/Cibertec;
 idempotencia y ausencia de duplicados; captura sin cambios no crea versión;

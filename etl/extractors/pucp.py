@@ -447,7 +447,7 @@ class PucpETLService:
         cur.execute(
             """
             INSERT INTO ingestion_log (source_id, status, started_at, counts)
-            VALUES (%s, 'PARTIAL', now(), '{}'::jsonb)
+            VALUES (%s, 'RUNNING', now(), '{}'::jsonb)
             RETURNING id;
             """,
             (source_id,),
@@ -823,16 +823,22 @@ class PucpETLService:
             time_module.sleep(0.8)
 
         # Estado final de la corrida
-        final_status = "OK"
+        quality_status = "OK"
         if counts["processed_ok"] == 0 and counts["discovered"] > 0:
-            final_status = "FAILED"
+            quality_status = "FAILED"
         elif counts["quarantined"] > 0 or counts["http_errors"] > 0:
-            final_status = "PARTIAL"
+            quality_status = "PARTIAL"
 
         with connection.cursor() as cur:
+            if quality_status == "FAILED":
+                final_status = "FAILED"
+            else:
+                final_status = "COMPLETED"
+            counts["quality_status"] = quality_status
+            counts["status"] = final_status
             self._finish_ingestion_log(cur, ingestion_id, final_status, counts)
 
-        self._print_omitted_report(counts, final_status)
+        self._print_omitted_report(counts, quality_status)
         return counts
 
     def _print_omitted_report(self, counts: dict, status: str):

@@ -105,7 +105,7 @@ class Phase3PostgreSQLIntegrationTests(SimpleTestCase):
         return self.conn.execute(
             """
             INSERT INTO ingestion_log (source_id, status, counts)
-            VALUES (%s, 'OK', '{}'::jsonb)
+            VALUES (%s, 'COMPLETED', '{}'::jsonb)
             RETURNING id;
             """,
             (source_id,),

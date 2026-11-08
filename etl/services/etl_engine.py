@@ -54,7 +54,9 @@ class ETLEngine:
             return CibertecExtractor()
         raise ValueError(f"Fuente no soportada: {self.source_code}")
 
-    def run(self, limit: int | None = None) -> dict[str, Any]:
+    def run(
+        self, limit: int | None = None, *, respect_schedule: bool = False
+    ) -> dict[str, Any]:
         run_start = timezone.now()
         counts = {
             "discovered": 0,
@@ -66,9 +68,36 @@ class ETLEngine:
             "catalog_complete": False,
         }
         self.ensure_sources([self.source_code])
-        source_id, ingestion_id = self._start_ingestion(run_start)
+        with connection.cursor() as cursor:
+            source_id = self.ingestion_repository.source_id(
+                cursor, self.source_code
+            )
+            acquired = self.ingestion_repository.try_source_lock(cursor, source_id)
+        if not acquired:
+            counts.update(status="SKIPPED", skip_reason="SOURCE_LOCKED")
+            return counts
+
+        ingestion_id = None
         saved_page_count = 0
         try:
+            if respect_schedule and not self._source_is_due(source_id):
+                counts.update(status="SKIPPED", skip_reason="NOT_DUE")
+                return counts
+
+            with transaction.atomic(), connection.cursor() as cursor:
+                abandoned_ids = self.ingestion_repository.recover_abandoned(
+                    cursor, source_id
+                )
+                for abandoned_id in abandoned_ids:
+                    self.resilience.failed(
+                        cursor,
+                        source_id,
+                        abandoned_id,
+                        "CONSECUTIVE_FAIL",
+                        "Corrida RUNNING recuperada tras perderse la sesión que mantenía el lock.",
+                    )
+
+            source_id, ingestion_id = self._start_ingestion(run_start)
             active_count_before = self._active_course_count(source_id)
             catalog = self.extractor.fetch_catalog_index()
             catalog_complete = bool(
@@ -137,17 +166,20 @@ class ETLEngine:
                     if counts["quarantined"] or not catalog_complete
                     else "OK"
                 )
+                counts["quality_status"] = run_status
                 self._finish_ingestion(
                     cursor,
                     ingestion_id,
-                    run_status,
+                    "COMPLETED",
                     counts,
                 )
                 self.resilience.succeeded(cursor, source_id)
-                self._purge_raw_pages(cursor)
-            counts["status"] = run_status
+                self._purge_retained_data(cursor)
+            counts["status"] = "COMPLETED"
             return counts
         except Exception as exc:
+            if ingestion_id is None:
+                raise
             error_message = "".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__)
             )
@@ -161,14 +193,38 @@ class ETLEngine:
                 self.resilience.failed(
                     cursor, source_id, ingestion_id, failure_type, str(exc)
                 )
-                self._purge_raw_pages(cursor)
+                self._purge_retained_data(cursor)
             logger.error("Ingesta %s fallida: %s", self.source_code, exc)
             counts["status"] = "FAILED"
             return counts
         finally:
-            close = getattr(self.extractor, "close", None)
-            if close:
-                close()
+            try:
+                close = getattr(self.extractor, "close", None)
+                if close:
+                    close()
+            finally:
+                with connection.cursor() as cursor:
+                    released = self.ingestion_repository.release_source_lock(
+                        cursor, source_id
+                    )
+                if not released:
+                    raise RuntimeError(
+                        f"No se pudo liberar el lock de la fuente {self.source_code}."
+                    )
+
+    @staticmethod
+    def _source_is_due(source_id: int) -> bool:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT active, next_run_at FROM source WHERE id = %s;",
+                (source_id,),
+            )
+            row = cursor.fetchone()
+        return bool(
+            row
+            and row[0]
+            and (row[1] is None or row[1] <= timezone.now())
+        )
 
     @classmethod
     def ensure_sources(cls, source_codes: list[str]) -> None:
@@ -224,8 +280,8 @@ class ETLEngine:
         )
 
     @staticmethod
-    def _purge_raw_pages(cursor):
-        IngestionRepository.purge_raw_pages(cursor, read_settings(cursor))
+    def _purge_retained_data(cursor):
+        IngestionRepository.purge_retained_data(cursor, read_settings(cursor))
 
     @staticmethod
     def _finish_ingestion(cursor, ingestion_id, status, counts, error_msg=None):

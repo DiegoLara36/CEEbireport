@@ -73,7 +73,7 @@ CATEGORY_OPTIONS_SQL = """
 SOURCE_SUMMARY_SQL = """
     SELECT COUNT(DISTINCT course.id),
            MAX(ingestion_log.finished_at)
-               FILTER (WHERE ingestion_log.status IN ('OK', 'PARTIAL'))
+               FILTER (WHERE ingestion_log.status = 'COMPLETED')
     FROM source
     LEFT JOIN course
       ON course.source_id = source.id

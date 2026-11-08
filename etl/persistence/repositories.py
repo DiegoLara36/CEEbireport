@@ -22,6 +22,11 @@ AUTHORITATIVE_STATUSES = {
     ObservationStatus.OBSERVED.value,
     ObservationStatus.NOT_FOUND.value,
 }
+SOURCE_LOCK_NAMESPACE = 0x43454542
+
+
+class IdentityCollisionError(ValueError):
+    """Raised when an external identity and canonical URL point to different courses."""
 
 
 def _json(value: Any) -> str:
@@ -154,12 +159,56 @@ class IngestionRepository:
             cursor.execute(
                 """
                 INSERT INTO ingestion_log (source_id, status, started_at, counts)
-                VALUES (%s, 'PARTIAL', %s, '{}'::jsonb)
+                VALUES (%s, 'RUNNING', %s, '{}'::jsonb)
                 RETURNING id;
                 """,
                 (source_id, started_at),
             )
             return source_id, cursor.fetchone()[0]
+
+    @staticmethod
+    def source_id(cursor, source_code: str) -> int:
+        cursor.execute("SELECT id FROM source WHERE code = %s;", (source_code,))
+        row = cursor.fetchone()
+        if not row:
+            raise ValueError(f"No existe la fuente {source_code} en la tabla source.")
+        return row[0]
+
+    @staticmethod
+    def try_source_lock(cursor, source_id: int) -> bool:
+        cursor.execute(
+            "SELECT pg_try_advisory_lock(%s, %s);",
+            (SOURCE_LOCK_NAMESPACE, source_id),
+        )
+        return bool(cursor.fetchone()[0])
+
+    @staticmethod
+    def release_source_lock(cursor, source_id: int) -> bool:
+        cursor.execute(
+            "SELECT pg_advisory_unlock(%s, %s);",
+            (SOURCE_LOCK_NAMESPACE, source_id),
+        )
+        return bool(cursor.fetchone()[0])
+
+    @staticmethod
+    def recover_abandoned(cursor, source_id: int) -> list[int]:
+        cursor.execute(
+            """
+            UPDATE ingestion_log
+               SET status = 'ABANDONED',
+                   finished_at = COALESCE(finished_at, clock_timestamp()),
+                   error_msg = COALESCE(
+                       error_msg,
+                       'Proceso interrumpido; corrida recuperada al adquirir el lock de fuente.'
+                   ),
+                   counts = COALESCE(counts, '{}'::jsonb)
+                       || '{"recovery_reason":"process_interrupted"}'::jsonb
+             WHERE source_id = %s AND status = 'RUNNING'
+            RETURNING id;
+            """,
+            (source_id,),
+        )
+        return [row[0] for row in cursor.fetchall()]
 
     @staticmethod
     def active_course_count(cursor, source_id: int) -> int:
@@ -221,14 +270,51 @@ class IngestionRepository:
         )
 
     @staticmethod
-    def purge_raw_pages(cursor, values: dict[str, str]) -> None:
+    def purge_retained_data(
+        cursor, values: dict[str, str], now=None
+    ) -> dict[str, int]:
         from etl.services.resilience_service import setting_int
 
-        retention = setting_int(values, "retention_raw_page_days", 90)
+        raw_page_days = setting_int(values, "retention_raw_page_days", 90)
+        quarantine_days = setting_int(
+            values, "retention_resolved_quarantine_days", 90
+        )
+        diagnostic_months = setting_int(
+            values, "retention_ingestion_diagnostic_months", 24
+        )
+        if min(raw_page_days, quarantine_days, diagnostic_months) < 0:
+            raise ValueError("Los periodos de retención no pueden ser negativos.")
+        now = now or timezone.now()
+
         cursor.execute(
             "DELETE FROM raw_page WHERE fetched_at < %s;",
-            (timezone.now() - timedelta(days=retention),),
+            (now - timedelta(days=raw_page_days),),
         )
+        raw_pages = cursor.rowcount
+        cursor.execute(
+            """
+            DELETE FROM quarantine_record
+             WHERE resolved = TRUE AND resolved_at < %s;
+            """,
+            (now - timedelta(days=quarantine_days),),
+        )
+        quarantines = cursor.rowcount
+        cursor.execute(
+            """
+            UPDATE ingestion_log
+               SET counts = NULL, error_msg = NULL
+             WHERE finished_at < %s - (%s * INTERVAL '1 month')
+               AND status IN ('COMPLETED', 'FAILED', 'ABANDONED')
+               AND (counts IS NOT NULL OR error_msg IS NOT NULL);
+            """,
+            (now, diagnostic_months),
+        )
+        diagnostics = cursor.rowcount
+        return {
+            "raw_pages": raw_pages,
+            "quarantines": quarantines,
+            "diagnostics": diagnostics,
+        }
 
     def mark_missing(self, cursor, source_id, ingestion_id, run_start) -> None:
         cursor.execute(
@@ -1478,6 +1564,7 @@ class CourseRepository:
 
     @staticmethod
     def _find_course(cursor, source_id, external_id, canonical_url):
+        candidates = []
         cursor.execute(
             """
             SELECT id, canonical_hash, state, category_id, has_certificate,
@@ -1490,13 +1577,7 @@ class CourseRepository:
         )
         row = cursor.fetchone()
         if row:
-            return row[0], {
-                "fingerprint": row[1],
-                "state": row[2],
-                "category_id": row[3],
-                "has_certificate": row[4],
-                "has_participation_certificate": row[5],
-            }
+            candidates.append(("external_id", row))
         cursor.execute(
             """
             SELECT c.id, c.canonical_hash, c.state, c.category_id,
@@ -1509,7 +1590,9 @@ class CourseRepository:
             (source_id, external_id),
         )
         row = cursor.fetchone()
-        if not row and canonical_url:
+        if row:
+            candidates.append(("alias", row))
+        if canonical_url:
             cursor.execute(
                 """
                 SELECT id, canonical_hash, state, category_id,
@@ -1521,6 +1604,16 @@ class CourseRepository:
                 (source_id, canonical_url),
             )
             row = cursor.fetchone()
+            if row:
+                candidates.append(("canonical_url", row))
+        candidate_ids = {row[0] for _, row in candidates}
+        if len(candidate_ids) > 1:
+            identities = ", ".join(identity for identity, _ in candidates)
+            raise IdentityCollisionError(
+                "La identidad externa y la URL canónica apuntan a cursos distintos "
+                f"({identities}); el registro requiere revisión."
+            )
+        row = candidates[0][1] if candidates else None
         return (
             (row[0], {
                 "fingerprint": row[1],
@@ -1938,7 +2031,7 @@ class CourseRepository:
         )
         row = cursor.fetchone()
         if row and row[0] != course_id:
-            raise ValueError(
+            raise IdentityCollisionError(
                 f"El identificador externo {external_id!r} ya está asociado a otro curso."
             )
         return bool(row)
@@ -1959,6 +2052,6 @@ class CourseRepository:
         )
         row = cursor.fetchone()
         if row[0] != course_id:
-            raise ValueError(
+            raise IdentityCollisionError(
                 f"El identificador externo {external_id!r} ya está asociado a otro curso."
             )
