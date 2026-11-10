@@ -1,175 +1,225 @@
-from collections import Counter
-
 from django.db import connection
 from django.shortcuts import render
 
 
-COURSE_REPORT_SQL = """
-    SELECT
-        course.id,
-        course.name,
-        COALESCE(category.name, 'Sin categoría') AS category_name,
-        course.course_url,
-        course.duration_hours,
-        course.has_certificate,
-        offering.start_date,
-        offering.end_date,
-        offering.modality_name,
-        price.list_amount,
-        price.final_amount,
-        price.currency
-    FROM course
-    JOIN source ON source.id = course.source_id
-    LEFT JOIN category ON category.id = course.category_id
-    LEFT JOIN LATERAL (
-        SELECT
-            course_offering.id,
-            course_offering.start_date,
-            course_offering.end_date,
-            modality.name AS modality_name
-        FROM course_offering
-        LEFT JOIN modality ON modality.id = course_offering.modality_id
-        WHERE course_offering.course_id = course.id
-          AND course_offering.state = 'ACTIVE'
-        ORDER BY (course_offering.start_date < CURRENT_DATE) ASC NULLS LAST,
-                 course_offering.start_date ASC NULLS LAST,
-                 course_offering.last_seen_at DESC
-        LIMIT 1
-    ) AS offering ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT price_snapshot.list_amount,
-               price_snapshot.final_amount,
-               price_snapshot.currency
-        FROM price_snapshot
-        WHERE price_snapshot.offering_id = offering.id
-          AND price_snapshot.is_current = TRUE
-        ORDER BY price_snapshot.valid_from DESC,
-                 price_snapshot.created_at DESC
-        LIMIT 1
-    ) AS price ON TRUE
-    WHERE source.code = %s
-      AND source.active = TRUE
-      AND course.state = 'ACTIVE'
-      AND (
-          %s = ''
-          OR course.name ILIKE %s
-          OR COALESCE(category.name, '') ILIKE %s
-      )
-      AND (%s = '' OR COALESCE(category.name, 'Sin categoría') = %s)
-    ORDER BY course.name;
+KPI_SQL = """
+    SELECT source_code, currency, active_courses, current_offers,
+           average_price, average_cost_per_hour, average_duration_hours,
+           discount_or_installment_pct
+    FROM bi.v_kpi_summary
+    WHERE (%s = '' OR source_code = %s)
+      AND (%s = '' OR currency = %s)
+    ORDER BY source_code, currency;
 """
 
-CATEGORY_OPTIONS_SQL = """
-    SELECT DISTINCT COALESCE(category.name, 'Sin categoría')
-    FROM course
-    JOIN source ON source.id = course.source_id
-    LEFT JOIN category ON category.id = course.category_id
-    WHERE source.code = %s
-      AND source.active = TRUE
-      AND course.state = 'ACTIVE'
-    ORDER BY 1;
+FILTER_OPTIONS_SQL = """
+    SELECT DISTINCT category_name, modality
+    FROM bi.v_current_catalog
+    ORDER BY category_name, modality;
 """
 
-SOURCE_SUMMARY_SQL = """
-    SELECT COUNT(DISTINCT course.id),
-           MAX(ingestion_log.finished_at)
-               FILTER (WHERE ingestion_log.status = 'COMPLETED')
-    FROM source
-    LEFT JOIN course
-      ON course.source_id = source.id
-     AND course.state = 'ACTIVE'
-    LEFT JOIN ingestion_log ON ingestion_log.source_id = source.id
-    WHERE source.code = %s
-      AND source.active = TRUE;
+COURSE_TOTALS_SQL = """
+    SELECT source_code, COUNT(*)
+    FROM bi.v_current_catalog
+    GROUP BY source_code
+    ORDER BY source_code;
 """
+
+COURSES_SQL = """
+    SELECT course_id, offering_id, source_code, course_name, category_name,
+           modality, duration_hours, duration_weeks, course_url,
+           has_certificate, list_amount, final_amount, currency,
+           cost_per_hour, has_discount, has_financing, instructors,
+           certificates, start_date, end_date
+    FROM bi.v_current_catalog
+    WHERE (%s = '' OR source_code = %s)
+      AND (%s = '' OR modality = %s)
+      AND (%s = '' OR category_name = %s)
+      AND (%s = '' OR currency = %s)
+      AND (%s = '' OR course_name ILIKE %s OR category_name ILIKE %s)
+    ORDER BY source_code, course_name;
+"""
+
+CATEGORY_CHART_SQL = """
+    SELECT source_code, currency, normalized_category, category_name, modality,
+           course_count, average_cost_per_hour
+    FROM bi.v_courses_by_category
+    WHERE (%s = '' OR source_code = %s)
+      AND (%s = '' OR modality = %s)
+      AND (%s = '' OR category_name = %s)
+      AND (%s = '' OR currency = %s)
+    ORDER BY category_name, source_code;
+"""
+
+
+def _read_rows(cursor, sql, params=()):
+    cursor.execute(sql, params)
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
 def dashboard(request):
     query = request.GET.get("q", "").strip()
+    selected_source = request.GET.get("source", "").strip().upper()
+    if selected_source not in {"", "PUCP", "CIBERTEC"}:
+        selected_source = ""
+    selected_modality = request.GET.get("modality", "").strip()
     selected_category = request.GET.get("category", "").strip()
+    selected_currency = request.GET.get("currency", "").strip().upper()
+    if selected_currency not in {"", "PEN", "USD"}:
+        selected_currency = ""
     search_pattern = f"%{query}%"
+    common_filters = (
+        selected_source,
+        selected_source,
+        selected_modality,
+        selected_modality,
+        selected_category,
+        selected_category,
+        selected_currency,
+        selected_currency,
+    )
 
     with connection.cursor() as cursor:
-        cursor.execute(SOURCE_SUMMARY_SQL, ["PUCP"])
-        catalog_total, last_updated = cursor.fetchone()
-        cursor.execute(CATEGORY_OPTIONS_SQL, ["PUCP"])
-        categories = [row[0] for row in cursor.fetchall()]
-        cursor.execute(
-            COURSE_REPORT_SQL,
-            [
-                "PUCP",
-                query,
-                search_pattern,
-                search_pattern,
-                selected_category,
-                selected_category,
-            ],
+        kpis = _read_rows(
+            cursor,
+            KPI_SQL,
+            (selected_source, selected_source, selected_currency, selected_currency),
         )
-        rows = cursor.fetchall()
-
-    courses = []
-    for row in rows:
-        courses.append(
-            {
-                "id": row[0],
-                "name": row[1],
-                "category": row[2],
-                "url": row[3],
-                "duration_hours": row[4],
-                "has_certificate": row[5],
-                "start_date": row[6],
-                "end_date": row[7],
-                "modality": row[8],
-                "list_amount": row[9],
-                "final_amount": row[10],
-                "display_price": row[10] if row[10] is not None else row[9],
-                "has_price": row[9] is not None or row[10] is not None,
-                "currency": row[11],
-            }
+        options = _read_rows(cursor, FILTER_OPTIONS_SQL)
+        cursor.execute(COURSE_TOTALS_SQL)
+        course_totals = dict(cursor.fetchall())
+        courses = _read_rows(
+            cursor,
+            COURSES_SQL,
+            common_filters
+            + (query, search_pattern, search_pattern),
         )
+        category_rows = _read_rows(cursor, CATEGORY_CHART_SQL, common_filters)
 
-    category_counts = Counter(course["category"] for course in courses)
-    highest_category = category_counts.most_common(1)
-    highest_category_name, highest_category_count = (
-        highest_category[0] if highest_category else ("", 0)
-    )
-    total_filtered = len(courses)
-    priced_courses = sum(course["has_price"] for course in courses)
-
-    category_breakdown = [
-        {
-            "name": category,
-            "count": count,
-            "percentage": (
-                round(count * 100 / total_filtered) if total_filtered else 0
-            ),
+    course_counts = {
+        "PUCP": course_totals.get("PUCP", 0),
+        "CIBERTEC": course_totals.get("CIBERTEC", 0),
+    }
+    if selected_source:
+        course_counts = {
+            source: total if source == selected_source else 0
+            for source, total in course_counts.items()
         }
-        for category, count in sorted(
-            category_counts.items(), key=lambda item: (-item[1], item[0].casefold())
-        )
+
+    currency_kpis = {}
+    for row in kpis:
+        currency = row["currency"] or "Sin moneda"
+        currency_kpis.setdefault(currency, []).append(row)
+
+    chart_categories = sorted(
+        {
+            (row["currency"], row["category_name"], row["modality"])
+            for row in category_rows
+            if row["currency"] is not None
+        },
+        key=lambda item: (item[0], item[1].casefold(), item[2].casefold()),
+    )
+    chart_sources = ("PUCP", "CIBERTEC")
+    category_cost_datasets = []
+    currencies = sorted({currency for currency, _, _ in chart_categories})
+    for currency in currencies:
+        for source, color in zip(
+            chart_sources,
+            (
+                "#830c0f" if currency == "PEN" else "#4f0709",
+                "#686868" if currency == "PEN" else "#9a9a9a",
+            ),
+        ):
+            values = []
+            for category_currency, category, modality in chart_categories:
+                match = next(
+                    (
+                        row
+                        for row in category_rows
+                        if row["source_code"] == source
+                        and row["currency"] == category_currency
+                        and row["category_name"] == category
+                        and row["modality"] == modality
+                    ),
+                    None,
+                )
+                values.append(
+                    float(match["average_cost_per_hour"])
+                    if match and match["average_cost_per_hour"] is not None
+                    else None
+                )
+            category_cost_datasets.append(
+                {
+                    "label": f"{source} · {currency}",
+                    "data": values,
+                    "backgroundColor": color,
+                }
+            )
+
+    modality_counts = {}
+    for course in courses:
+        key = (course["source_code"], course["modality"])
+        modality_counts[key] = modality_counts.get(key, 0) + 1
+    modalities = sorted({modality for _, modality in modality_counts})
+    modality_datasets = [
+        {
+            "label": source,
+            "data": [modality_counts.get((source, modality), 0) for modality in modalities],
+            "backgroundColor": color,
+        }
+        for source, color in zip(chart_sources, ("#830c0f", "#686868"))
     ]
+
+    category_volumes = {}
+    for row in category_rows:
+        key = (row["source_code"], row["currency"], row["category_name"])
+        category_volumes[key] = category_volumes.get(key, 0) + row["course_count"]
+    top_categories = sorted(
+        category_volumes.items(),
+        key=lambda item: (-item[1], item[0][2].casefold()),
+    )[:8]
+    for course in courses:
+        course["display_price"] = (
+            course["final_amount"]
+            if course["final_amount"] is not None
+            else course["list_amount"]
+        )
+
+    chart_data = {
+        "categoryCosts": {
+            "labels": [
+                f"{currency} · {category} · {modality}"
+                for currency, category, modality in chart_categories
+            ],
+            "datasets": category_cost_datasets,
+        },
+        "modalities": {"labels": modalities, "datasets": modality_datasets},
+        "topCategories": {
+            "labels": [
+                f"{source} · {category} · {currency or 'Sin moneda'}"
+                for (source, currency, category), _ in top_categories
+            ],
+            "data": [count for _, count in top_categories],
+        },
+    }
 
     return render(
         request,
         "catalog/dashboard.html",
         {
+            "title": "Reporte BI de Centro de Especialización Ejecutiva",
             "courses": courses,
             "query": query,
+            "selected_source": selected_source,
+            "selected_modality": selected_modality,
             "selected_category": selected_category,
-            "categories": categories,
-            "total_courses": total_filtered,
-            "catalog_total": catalog_total or 0,
-            "category_total": len(category_counts),
-            "priced_courses": priced_courses,
-            "highest_category_name": highest_category_name,
-            "highest_category_count": highest_category_count,
-            "highest_category_percentage": (
-                round(highest_category_count * 100 / total_filtered)
-                if total_filtered
-                else 0
-            ),
-            "category_breakdown": category_breakdown,
-            "last_updated": last_updated,
+            "selected_currency": selected_currency,
+            "categories": sorted({row["category_name"] for row in options}),
+            "modalities": sorted({row["modality"] for row in options}),
+            "course_counts": course_counts,
+            "currency_kpis": currency_kpis,
+            "chart_data": chart_data,
         },
     )
 

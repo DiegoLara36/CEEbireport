@@ -4,13 +4,14 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#102b3f">
-    <title>{% block title %}CEE BI · Educación continua{% endblock %}</title>
+    <meta name="theme-color" content="#830c0f">
+    <title>{% block title %}Reporte BI de Centro de Especialización Ejecutiva{% endblock %}</title>
     <link rel="stylesheet" href="{% static 'catalog/report.css' %}">
 </head>
 <body>
     <header class="site-header">
         <a class="brand" href="{% url 'dashboard' %}" aria-label="CEE BI, inicio">
+            <img class="brand-logo" src="{% static 'catalog/img/simbolocee.png' %}" alt="Centro de Especialización Ejecutiva" onerror="this.hidden=true">
             <span class="brand-mark">CEE</span>
             <span class="brand-copy"><strong>CEE BI</strong><small>Educación continua</small></span>
         </a>
@@ -18,14 +19,14 @@
             <a href="{% url 'dashboard' %}" class="{% if request.resolver_match.url_name == 'dashboard' %}is-active{% endif %}">Reporte BI</a>
             <a href="{% url 'etl_flow' %}" class="{% if request.resolver_match.url_name == 'etl_flow' %}is-active{% endif %}">Flujo ETL</a>
         </nav>
-        <span class="header-source"><span class="status-dot"></span> Fuente activa · PUCP</span>
+        <span class="header-source"><span class="status-dot"></span> Fuentes activas · PUCP y Cibertec</span>
     </header>
     <main>
         {% block content %}{% endblock %}
     </main>
     <footer class="site-footer">
         <span>CEE BI <span class="footer-separator">/</span> Inteligencia de cursos</span>
-        <span>Catálogo de Educación Continua PUCP</span>
+        <span>Catálogo de Educación Continua · PUCP y Cibertec</span>
     </footer>
 </body>
 </html>

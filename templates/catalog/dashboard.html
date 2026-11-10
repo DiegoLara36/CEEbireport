@@ -1,141 +1,155 @@
 {% extends "catalog/base.html" %}
 
-{% block title %}Reporte de cursos · CEE BI{% endblock %}
+{% block title %}Reporte BI de Centro de Especialización Ejecutiva{% endblock %}
 
 {% block content %}
 <section class="page-intro">
     <div>
-        <p class="eyebrow">REPORTE DE OFERTA ACADÉMICA <span class="eyebrow-line"></span></p>
-        <h1>Cursos de Educación Continua</h1>
-        <p class="intro-copy">Una vista clara del catálogo PUCP para explorar su oferta por área temática.</p>
+        <p class="eyebrow">INTELIGENCIA DE OFERTA ACADÉMICA <span class="eyebrow-line"></span></p>
+        <h1>Reporte BI de Centro de Especialización Ejecutiva</h1>
+        <p class="intro-copy">Catálogo y métricas comparables de PUCP y Cibertec, consultados desde vistas analíticas de PostgreSQL.</p>
     </div>
-    <a class="outline-link" href="{% url 'etl_flow' %}">
-        <span class="link-icon" aria-hidden="true">↗</span> Ver cómo se construye este reporte
-    </a>
+    <a class="outline-link" href="{% url 'etl_flow' %}"><span class="link-icon" aria-hidden="true">↗</span> Ver flujo ETL</a>
 </section>
 
-<section class="metric-grid" aria-label="Indicadores del catálogo">
+<section class="metric-grid" aria-label="Indicadores ejecutivos">
     <article class="metric-card metric-primary">
-        <span class="metric-label">Cursos activos en vista</span>
-        <div class="metric-value">{{ total_courses }}<span class="metric-unit">cursos</span></div>
-        <span class="metric-note">de {{ catalog_total }} activos en PUCP</span>
-        <span class="metric-watermark" aria-hidden="true">01</span>
+        <span class="metric-label">Cursos activos · PUCP</span>
+        <div class="metric-value">{{ course_counts.PUCP }}<span class="metric-unit">cursos</span></div>
+        <span class="metric-note">Catálogo activo</span>
+    </article>
+    <article class="metric-card metric-primary">
+        <span class="metric-label">Cursos activos · Cibertec</span>
+        <div class="metric-value">{{ course_counts.CIBERTEC }}<span class="metric-unit">cursos</span></div>
+        <span class="metric-note">Catálogo activo</span>
     </article>
     <article class="metric-card">
-        <span class="metric-label">Áreas temáticas</span>
-        <div class="metric-value">{{ category_total }}<span class="metric-unit">áreas</span></div>
-        <span class="metric-note">en los cursos de la vista</span>
-        <span class="metric-watermark" aria-hidden="true">02</span>
+        <span class="metric-label">Costo promedio por hora</span>
+        {% for currency, rows in currency_kpis.items %}
+            <div class="metric-line"><strong>{{ currency }}</strong>
+                {% for row in rows %}<span>{{ row.source_code }} {{ row.average_cost_per_hour|floatformat:2|default:"—" }}</span>{% endfor %}
+            </div>
+        {% empty %}<span class="metric-note">Sin datos</span>{% endfor %}
     </article>
     <article class="metric-card">
-        <span class="metric-label">Cursos con precio vigente</span>
-        <div class="metric-value">{{ priced_courses }}<span class="metric-unit">cursos</span></div>
-        <span class="metric-note">según la última tarifa vigente</span>
-        <span class="metric-watermark" aria-hidden="true">03</span>
+        <span class="metric-label">Ticket promedio del curso</span>
+        {% for currency, rows in currency_kpis.items %}
+            <div class="metric-line"><strong>{{ currency }}</strong>
+                {% for row in rows %}<span>{{ row.source_code }} {{ row.average_price|floatformat:2|default:"—" }}</span>{% endfor %}
+            </div>
+        {% empty %}<span class="metric-note">Sin datos</span>{% endfor %}
     </article>
     <article class="metric-card">
-        <span class="metric-label">Área con más cursos</span>
-        <div class="metric-value metric-category-value">{{ highest_category_count }}<span class="metric-unit">cursos</span></div>
-        <span class="metric-note">{{ highest_category_name|default:"Sin datos" }}{% if total_courses %} · {{ highest_category_percentage }}% de la vista{% endif %}</span>
-        <span class="metric-watermark" aria-hidden="true">04</span>
+        <span class="metric-label">Duración media</span>
+        {% for currency, rows in currency_kpis.items %}
+            <div class="metric-line"><strong>{{ currency }}</strong>
+                {% for row in rows %}<span>{{ row.source_code }} {{ row.average_duration_hours|floatformat:1|default:"—" }} h</span>{% endfor %}
+            </div>
+        {% empty %}<span class="metric-note">Sin datos</span>{% endfor %}
+    </article>
+    <article class="metric-card">
+        <span class="metric-label">Ofertas con descuento o cuotas</span>
+        {% for currency, rows in currency_kpis.items %}
+            <div class="metric-line"><strong>{{ currency }}</strong>
+                {% for row in rows %}<span>{{ row.source_code }} {{ row.discount_or_installment_pct|floatformat:1|default:"0" }}%</span>{% endfor %}
+            </div>
+        {% empty %}<span class="metric-note">Sin datos</span>{% endfor %}
     </article>
 </section>
 
-<section class="report-grid">
-    <article class="panel distribution-panel">
+<section class="chart-grid" aria-label="Gráficas de catálogo">
+    <article class="panel chart-panel">
         <div class="panel-heading">
-            <div>
-                <p class="eyebrow">COMPOSICIÓN DEL CATÁLOGO</p>
-                <h2>Cursos por área</h2>
-            </div>
-            <span class="panel-caption">{{ category_total }} áreas</span>
+            <div><p class="eyebrow">PRECIO NORMALIZADO POR DURACIÓN</p><h2>Costo por hora por categoría</h2></div>
+            <span class="panel-caption">{% if selected_currency %}{{ selected_currency }}{% else %}Selecciona moneda en filtros{% endif %}</span>
         </div>
-        {% if category_breakdown %}
-            <div class="bar-chart" role="list" aria-label="Cantidad de cursos por área">
-                {% for item in category_breakdown %}
-                    <div class="bar-row" role="listitem">
-                        <span class="bar-label" title="{{ item.name }}">{{ item.name }}</span>
-                        <span class="bar-track"><span class="bar-fill" style="width: {{ item.percentage }}%"></span></span>
-                        <span class="bar-count">{{ item.count }}</span>
-                    </div>
-                {% endfor %}
-            </div>
-        {% else %}
-            <p class="empty-state">No hay cursos para los filtros seleccionados.</p>
-        {% endif %}
-        <p class="chart-footnote">Distribución calculada sobre los cursos visibles.</p>
+        <div class="chart-wrap"><canvas id="category-cost-chart" aria-label="Costo promedio por hora por institución y categoría"></canvas></div>
     </article>
-
-    <article class="panel courses-panel">
+    <article class="panel chart-panel">
         <div class="panel-heading">
-            <div>
-                <p class="eyebrow">EXPLORADOR</p>
-                <h2>Oferta de cursos</h2>
-            </div>
-            <span class="result-count">{{ total_courses }} resultados</span>
+            <div><p class="eyebrow">COMPOSICIÓN ACADÉMICA</p><h2>Cursos por modalidad y fuente</h2></div>
         </div>
-        <form class="filters" method="get" action="{% url 'dashboard' %}">
-            <label class="search-field">
-                <span class="visually-hidden">Buscar curso o área</span>
-                <span class="search-icon" aria-hidden="true">⌕</span>
-                <input type="search" name="q" value="{{ query }}" placeholder="Buscar curso o área">
-            </label>
-            <label>
-                <span class="visually-hidden">Filtrar por área</span>
-                <select name="category" aria-label="Filtrar por área">
-                    <option value="">Todas las áreas</option>
-                    {% for category in categories %}
-                        <option value="{{ category }}" {% if selected_category == category %}selected{% endif %}>{{ category }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <button class="filter-button" type="submit">Filtrar</button>
-        </form>
-
-        {% if courses %}
-            <div class="course-list">
-                {% for course in courses %}
-                    <article class="course-item">
-                        <span class="course-index">{{ forloop.counter|stringformat:"02d" }}</span>
-                        <div class="course-info">
-                            <span class="category-tag">{{ course.category }}</span>
-                            <h3>{{ course.name }}</h3>
-                            <span class="course-details">
-                                {% if course.modality %}{{ course.modality }}{% endif %}
-                                {% if course.duration_hours %}{% if course.modality %}<span>·</span>{% endif %}{{ course.duration_hours }} h{% endif %}
-                                {% if course.start_date %}<span>·</span>Desde {{ course.start_date|date:"d/m/Y" }}{% endif %}
-                                {% if course.end_date %}<span>·</span>Hasta {{ course.end_date|date:"d/m/Y" }}{% endif %}
-                                {% if course.has_certificate %}<span>·</span>Certificado{% endif %}
-                            </span>
-                        </div>
-                        <div class="course-price">
-                            {% if course.has_price %}
-                                <strong>{{ course.display_price|floatformat:2 }}</strong>
-                                <span>{{ course.currency }}</span>
-                            {% else %}
-                                <span>Precio sin dato</span>
-                            {% endif %}
-                        </div>
-                        <a class="course-link" href="{{ course.url }}" target="_blank" rel="noopener noreferrer" aria-label="Ver {{ course.name }} en PUCP">
-                            <span aria-hidden="true">↗</span>
-                        </a>
-                    </article>
-                {% endfor %}
-            </div>
-        {% else %}
-            <div class="empty-state course-empty">
-                <span class="empty-mark" aria-hidden="true">⌕</span>
-                <strong>No encontramos cursos</strong>
-                <span>Prueba con otra búsqueda o selecciona todas las áreas.</span>
-            </div>
-        {% endif %}
-        <p class="data-note"><span aria-hidden="true">i</span> La fecha y el precio corresponden a la oferta activa y a su tarifa vigente en PostgreSQL.</p>
+        <div class="chart-wrap"><canvas id="modality-chart" aria-label="Distribución de cursos por modalidad y fuente"></canvas></div>
+    </article>
+    <article class="panel chart-panel chart-wide">
+        <div class="panel-heading">
+            <div><p class="eyebrow">VOLUMEN DE OFERTA</p><h2>Principales categorías</h2></div>
+        </div>
+        <div class="chart-wrap chart-wrap-short"><canvas id="category-volume-chart" aria-label="Top categorías por volumen de cursos"></canvas></div>
     </article>
 </section>
 
-<section class="source-strip">
-    <span class="source-icon" aria-hidden="true">↻</span>
-    <div><strong>Datos conectados a PostgreSQL</strong><span>Última ingesta completada: {% if last_updated %}{{ last_updated|date:"d/m/Y H:i" }}{% else %}sin ingestas registradas{% endif %}</span></div>
-    <a href="{% url 'etl_flow' %}">Conoce el flujo de datos <span aria-hidden="true">→</span></a>
+<section class="panel catalog-panel">
+    <div class="panel-heading">
+        <div><p class="eyebrow">EXPLORADOR COMPARATIVO</p><h2>Catálogo de cursos</h2></div>
+        <span class="result-count">{{ courses|length }} resultados</span>
+    </div>
+    <form class="filters" method="get" action="{% url 'dashboard' %}">
+        <label class="search-field">
+            <span class="visually-hidden">Buscar curso o categoría</span>
+            <input type="search" name="q" value="{{ query }}" placeholder="Buscar curso o categoría">
+        </label>
+        <label><span class="visually-hidden">Institución</span>
+            <select name="source" aria-label="Institución">
+                <option value="">Todas las instituciones</option>
+                <option value="PUCP" {% if selected_source == "PUCP" %}selected{% endif %}>PUCP</option>
+                <option value="CIBERTEC" {% if selected_source == "CIBERTEC" %}selected{% endif %}>Cibertec</option>
+            </select>
+        </label>
+        <label><span class="visually-hidden">Modalidad</span>
+            <select name="modality" aria-label="Modalidad">
+                <option value="">Todas las modalidades</option>
+                {% for modality in modalities %}<option value="{{ modality }}" {% if selected_modality == modality %}selected{% endif %}>{{ modality }}</option>{% endfor %}
+            </select>
+        </label>
+        <label><span class="visually-hidden">Categoría</span>
+            <select name="category" aria-label="Categoría">
+                <option value="">Todas las categorías</option>
+                {% for category in categories %}<option value="{{ category }}" {% if selected_category == category %}selected{% endif %}>{{ category }}</option>{% endfor %}
+            </select>
+        </label>
+        <label><span class="visually-hidden">Moneda</span>
+            <select name="currency" aria-label="Moneda">
+                <option value="">Todas las monedas</option>
+                <option value="PEN" {% if selected_currency == "PEN" %}selected{% endif %}>PEN</option>
+                <option value="USD" {% if selected_currency == "USD" %}selected{% endif %}>USD</option>
+            </select>
+        </label>
+        <button class="filter-button" type="submit">Aplicar filtros</button>
+    </form>
+
+    <div class="table-scroll">
+        <table class="course-table">
+            <thead><tr><th>Curso</th><th>Institución</th><th>Modalidad</th><th>Duración</th><th>Precio vigente</th><th>Costo por hora</th><th>Docentes / certificados</th><th>Enlace</th></tr></thead>
+            <tbody>
+            {% for course in courses %}
+                <tr>
+                    <td><strong>{{ course.course_name }}</strong><small>{{ course.category_name }}</small></td>
+                    <td><span class="source-badge source-{{ course.source_code|lower }}">{{ course.source_code }}</span></td>
+                    <td>{{ course.modality }}</td>
+                    <td>{% if course.duration_hours != None %}{{ course.duration_hours|floatformat:1 }} h{% endif %}{% if course.duration_weeks != None %}<small>{{ course.duration_weeks|floatformat:1 }} semanas</small>{% endif %}</td>
+                    <td>{% if course.display_price != None %}{{ course.display_price|floatformat:2 }} {{ course.currency|default:"—" }}{% else %}Sin precio publicado{% endif %}{% if course.has_discount %}<small class="discount-tag">Descuento vigente</small>{% endif %}{% if course.has_financing %}<small>Cuotas disponibles</small>{% endif %}</td>
+                    <td>{% if course.cost_per_hour != None %}<strong>{{ course.cost_per_hour|floatformat:2 }} {{ course.currency|default:"—" }} / hora</strong>{% else %}—{% endif %}</td>
+                    <td>{% for person in course.instructors|default_if_none:"" %}<small>{{ person }}</small>{% empty %}<small>Docentes no observados</small>{% endfor %}{% for certificate in course.certificates|default_if_none:"" %}<small>{{ certificate }}</small>{% endfor %}</td>
+                    <td>{% if course.course_url %}<a class="course-link" href="{{ course.course_url }}" target="_blank" rel="noopener noreferrer" aria-label="Ver {{ course.course_name }} en {{ course.source_code }}">↗</a>{% else %}—{% endif %}</td>
+                </tr>
+            {% empty %}
+                <tr><td class="empty-state" colspan="8">No hay cursos para los filtros seleccionados.</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    <p class="data-note"><span aria-hidden="true">i</span> Los importes se presentan en su moneda original; no se convierten ni se agregan entre monedas.</p>
 </section>
+{{ chart_data|json_script:"chart-data" }}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0"></script>
+<script>
+    const data = JSON.parse(document.getElementById("chart-data").textContent);
+    Chart.register(ChartDataLabels);
+    const common = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: "#686868" } }, datalabels: { color: "#fff", font: { weight: "bold", size: 10 } } } };
+    new Chart(document.getElementById("category-cost-chart"), { type: "bar", data: data.categoryCosts, options: { ...common, scales: { x: { ticks: { color: "#686868" } }, y: { beginAtZero: true, ticks: { color: "#686868" }, title: { display: true, text: "Costo por hora" } } }, plugins: { ...common.plugins, datalabels: { color: "#fff", formatter: value => value == null ? "" : Number(value).toFixed(2) } } } });
+    new Chart(document.getElementById("modality-chart"), { type: "bar", data: data.modalities, options: { ...common, scales: { x: { stacked: true, ticks: { color: "#686868" } }, y: { stacked: true, beginAtZero: true, ticks: { color: "#686868", precision: 0 } } }, plugins: { ...common.plugins, datalabels: { formatter: (value, context) => { if (!value) return ""; const total = context.chart.data.datasets.reduce((sum, item) => sum + Number(item.data[context.dataIndex] || 0), 0); return `${value} (${Math.round(value * 100 / total)}%)`; } } } } });
+    new Chart(document.getElementById("category-volume-chart"), { type: "bar", data: { labels: data.topCategories.labels, datasets: [{ label: "Cursos", data: data.topCategories.data, backgroundColor: "#830c0f" }] }, options: { ...common, indexAxis: "y", scales: { x: { beginAtZero: true, ticks: { precision: 0, color: "#686868" } }, y: { ticks: { color: "#686868" } } }, plugins: { ...common.plugins, legend: { display: false }, datalabels: { anchor: "end", align: "right", color: "#4f0709" } } } });
+</script>
 {% endblock %}

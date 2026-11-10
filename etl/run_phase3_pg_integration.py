@@ -78,6 +78,7 @@ def main() -> int:
 
     os.environ["CEEBI_RUN_PHASE3_PG_TESTS"] = "1"
     os.environ["CEEBI_RUN_PHASE4_PG_TESTS"] = "1"
+    os.environ["CEEBI_RUN_PHASE5_PG_TESTS"] = "1"
     os.environ["DJANGO_SETTINGS_MODULE"] = "ceebireport.phase3_test_settings"
     import django
 

@@ -4,6 +4,11 @@ BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS bi;
 
+DROP VIEW IF EXISTS bi.v_courses_by_category;
+DROP VIEW IF EXISTS bi.v_kpi_summary;
+DROP VIEW IF EXISTS bi.v_price_history;
+DROP VIEW IF EXISTS bi.v_current_catalog;
+
 CREATE OR REPLACE VIEW bi.v_current_catalog AS
 SELECT
     c.id AS course_id,
@@ -17,6 +22,14 @@ SELECT
         ),
         'Sin categoría'
     ) AS category_name,
+    COALESCE(
+        NULLIF(cv.attributes #>> '{category,normalized_label}', ''),
+        NULLIF(
+            LOWER(REGEXP_REPLACE(BTRIM(COALESCE(cat.name, '')), '\s+', '_', 'g')),
+            ''
+        ),
+        'sin_categoria'
+    ) AS normalized_category,
     CASE
         WHEN UPPER(COALESCE(m.code, m.name, '')) LIKE '%HIBRID%' THEN 'Híbrida'
         WHEN UPPER(COALESCE(m.code, m.name, '')) LIKE '%PRESEN%' THEN 'Presencial'
@@ -43,6 +56,13 @@ FROM course c
 JOIN source s ON s.id = c.source_id
 LEFT JOIN category cat ON cat.id = c.category_id
 LEFT JOIN LATERAL (
+    SELECT version.attributes
+    FROM course_version version
+    WHERE version.course_id = c.id AND version.valid_to IS NULL
+    ORDER BY version.valid_from DESC, version.id DESC
+    LIMIT 1
+) cv ON TRUE
+LEFT JOIN LATERAL (
     SELECT co.*
     FROM course_offering co
     WHERE co.course_id = c.id AND co.state = 'ACTIVE'
@@ -65,21 +85,14 @@ LEFT JOIN LATERAL (
     SELECT
         EXISTS (
             SELECT 1
-            FROM discount d
-            WHERE (d.course_id = c.id OR d.offering_id = o.id)
+            FROM price_snapshot_discount psd
+            JOIN discount d ON d.id = psd.discount_id
+            JOIN price_snapshot ps ON ps.id = psd.price_snapshot_id
+            WHERE ps.offering_id = o.id AND ps.is_current = TRUE
+              AND psd.applied = TRUE
+              AND (d.course_id = c.id OR d.offering_id = o.id)
               AND (d.valid_from IS NULL OR d.valid_from <= CURRENT_DATE)
               AND (d.valid_to IS NULL OR d.valid_to >= CURRENT_DATE)
-        ) OR EXISTS (
-            SELECT 1
-            FROM price_snapshot_discount psd
-            WHERE psd.price_snapshot_id = (
-                SELECT ps.id
-                FROM price_snapshot ps
-                WHERE ps.offering_id = o.id AND ps.is_current = TRUE
-                ORDER BY ps.valid_from DESC, ps.id DESC
-                LIMIT 1
-            )
-              AND psd.applied = TRUE
         ) AS has_discount,
         EXISTS (
             SELECT 1
@@ -119,17 +132,14 @@ WITH active_offerings AS (
         (
             EXISTS (
                 SELECT 1
-                FROM discount d
-                WHERE (d.course_id = c.id OR d.offering_id = o.id)
+                FROM price_snapshot_discount psd
+                JOIN discount d ON d.id = psd.discount_id
+                JOIN price_snapshot ps ON ps.id = psd.price_snapshot_id
+                WHERE ps.offering_id = o.id AND ps.is_current = TRUE
+                  AND psd.applied = TRUE
+                  AND (d.course_id = c.id OR d.offering_id = o.id)
                   AND (d.valid_from IS NULL OR d.valid_from <= CURRENT_DATE)
                   AND (d.valid_to IS NULL OR d.valid_to >= CURRENT_DATE)
-            ) OR EXISTS (
-                SELECT 1
-                FROM price_snapshot_discount psd
-                JOIN price_snapshot ps ON ps.id = psd.price_snapshot_id
-                WHERE ps.offering_id = o.id
-                  AND ps.is_current = TRUE
-                  AND psd.applied = TRUE
             )
         ) AS has_discount,
         EXISTS (
@@ -138,9 +148,10 @@ WITH active_offerings AS (
             WHERE pp.offering_id = o.id AND pp.is_current = TRUE
               AND pp.installments > 1
         ) AS has_financing
-    FROM course_offering o
-    JOIN course c ON c.id = o.course_id AND c.state = 'ACTIVE'
+    FROM course c
     JOIN source s ON s.id = c.source_id AND s.active = TRUE
+    LEFT JOIN course_offering o
+        ON o.course_id = c.id AND o.state = 'ACTIVE'
     LEFT JOIN LATERAL (
         SELECT ps.currency, ps.final_amount
         FROM price_snapshot ps
@@ -148,7 +159,7 @@ WITH active_offerings AS (
         ORDER BY ps.valid_from DESC, ps.id DESC
         LIMIT 1
     ) p ON TRUE
-    WHERE o.state = 'ACTIVE'
+    WHERE c.state = 'ACTIVE'
       AND s.code IN ('PUCP', 'CIBERTEC')
 )
 SELECT
@@ -175,12 +186,13 @@ CREATE OR REPLACE VIEW bi.v_courses_by_category AS
 SELECT
     source_code,
     currency,
+    normalized_category,
     category_name,
     modality,
     COUNT(*) AS course_count,
     AVG(cost_per_hour) AS average_cost_per_hour
 FROM bi.v_current_catalog
-GROUP BY source_code, currency, category_name, modality;
+GROUP BY source_code, currency, normalized_category, category_name, modality;
 
 COMMENT ON VIEW bi.v_courses_by_category IS
     'Granularity: institution, currency, normalized category, and normalized modality; one contribution per active course.';
@@ -223,7 +235,8 @@ BEGIN
 
     EXECUTE FORMAT('GRANT USAGE ON SCHEMA bi TO %I', reader_role);
     EXECUTE FORMAT(
-        'GRANT SELECT ON ALL TABLES IN SCHEMA bi TO %I',
+        'GRANT SELECT ON bi.v_current_catalog, bi.v_kpi_summary, '
+        'bi.v_courses_by_category, bi.v_price_history TO %I',
         reader_role
     );
 END;
