@@ -1,7 +1,8 @@
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, time
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -129,12 +130,20 @@ class CibertecExtractor:
         self.timeout_ms = timeout * 1000
         self.raw_pages: list[tuple[str, bytes]] = []
         self.catalog_complete = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cibertec-playwright"
+        )
+        self._closed = False
+        self._playwright_context = None
         self._playwright = None
         self._browser = None
         self._page = None
         self._playwright_timeout_error = TimeoutError
 
     def start(self) -> None:
+        self._run_on_worker(self._start)
+
+    def _start(self) -> None:
         if self._page:
             return
         try:
@@ -149,7 +158,10 @@ class CibertecExtractor:
             ) from exc
         self._playwright_timeout_error = PlaywrightTimeoutError
         try:
-            self._playwright = sync_playwright().start()
+            # Keep one context across catalog/detail calls on the isolated worker.
+            playwright_context = sync_playwright()
+            self._playwright = playwright_context.__enter__()
+            self._playwright_context = playwright_context
             self._browser = self._playwright.chromium.launch(
                 headless=True, timeout=self.timeout_ms
             )
@@ -163,27 +175,45 @@ class CibertecExtractor:
             self._page.set_default_timeout(self.timeout_ms)
             self._page.set_default_navigation_timeout(self.timeout_ms)
         except self._playwright_timeout_error as exc:
-            self.close()
+            self._close()
             raise CibertecExtractionError(
                 f"Timeout ({self.timeout}s) al iniciar Chromium para Cibertec."
             ) from exc
         except Exception as exc:
-            self.close()
+            self._close()
             raise CibertecExtractionError(
                 f"No se pudo inicializar Playwright para Cibertec: {exc}"
             ) from exc
 
     def close(self) -> None:
-        browser, playwright = self._browser, self._playwright
+        if self._closed:
+            return
+        try:
+            self._run_on_worker(self._close)
+        finally:
+            self._executor.shutdown(wait=True)
+            self._closed = True
+
+    def _close(self) -> None:
+        browser = self._browser
+        playwright_context = self._playwright_context
         try:
             if browser:
                 browser.close()
         finally:
             try:
-                if playwright:
-                    playwright.stop()
+                if playwright_context:
+                    playwright_context.__exit__(None, None, None)
             finally:
                 self._page = self._browser = self._playwright = None
+                self._playwright_context = None
+
+    def _run_on_worker(
+        self, operation: Callable[..., Any], *args: Any
+    ) -> Any:
+        if self._closed:
+            raise RuntimeError("El extractor Cibertec ya fue cerrado.")
+        return self._executor.submit(operation, *args).result()
 
     def _navigate(self, url: str):
         try:
@@ -223,8 +253,11 @@ class CibertecExtractor:
         return None
 
     def fetch_catalog_index(self) -> list[dict[str, Any]]:
+        return self._run_on_worker(self._fetch_catalog_index)
+
+    def _fetch_catalog_index(self) -> list[dict[str, Any]]:
         self.catalog_complete = False
-        self.start()
+        self._start()
         self._navigate(self.base_url)
         try:
             self._page.wait_for_selector(
@@ -377,7 +410,10 @@ class CibertecExtractor:
         return results
 
     def fetch_course(self, item: dict[str, Any]) -> tuple[ScrapedCourseDTO, str, bytes]:
-        self.start()
+        return self._run_on_worker(self._fetch_course, item)
+
+    def _fetch_course(self, item: dict[str, Any]) -> tuple[ScrapedCourseDTO, str, bytes]:
+        self._start()
         url = item["url"]
         try:
             self._navigate(url)

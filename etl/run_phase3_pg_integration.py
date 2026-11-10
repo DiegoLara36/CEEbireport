@@ -55,9 +55,14 @@ def prepare_database(config: dict[str, str]) -> None:
         migrations = sorted(
             (PROJECT_ROOT / "database" / "migrations").glob("[0-9][0-9][0-9]_*.sql")
         )
-        if not migrations or migrations[-1].name != "004_reliability.sql":
-            raise RuntimeError("No se encontró la migración de fiabilidad 004.")
+        if not migrations or migrations[-1].name != "005_bi_views.sql":
+            raise RuntimeError("No se encontró la migración de vistas BI 005.")
         for migration_path in migrations:
+            if migration_path.name == "005_bi_views.sql":
+                conn.execute(
+                    "SELECT set_config('ceebi.bi_reader_role', %s, false);",
+                    (config["user"],),
+                )
             execute_script(conn, migration_path.read_text(encoding="utf-8"))
 
 
@@ -78,12 +83,17 @@ def main() -> int:
 
     django.setup()
 
-    from etl import test_phase3_pg_integration, test_phase4_pg_integration
+    from etl import (
+        test_phase3_pg_integration,
+        test_phase4_pg_integration,
+        test_phase5_bi_integration,
+    )
 
     suite = unittest.TestSuite(
         [
             unittest.defaultTestLoader.loadTestsFromModule(test_phase3_pg_integration),
             unittest.defaultTestLoader.loadTestsFromModule(test_phase4_pg_integration),
+            unittest.defaultTestLoader.loadTestsFromModule(test_phase5_bi_integration),
         ]
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

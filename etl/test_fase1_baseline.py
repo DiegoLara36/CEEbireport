@@ -34,6 +34,11 @@ def fixture_text(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
 
+def run_cibertec_inline(extractor: CibertecExtractor) -> None:
+    extractor._run_on_worker = lambda operation, *args: operation(*args)
+    extractor._start = Mock()
+
+
 class PydanticContractBaselineTests(SimpleTestCase):
     def test_schedule_and_nested_contracts_validate(self):
         schedule = ScheduleItemSchema(
@@ -228,11 +233,9 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         page = Mock()
         page.goto.side_effect = TimeoutError("fixture navigation timeout")
         extractor._page = page
+        run_cibertec_inline(extractor)
 
-        with (
-            patch.object(extractor, "start"),
-            self.assertRaisesRegex(CibertecExtractionError, "buscador"),
-        ):
+        with self.assertRaisesRegex(CibertecExtractionError, "buscador"):
             extractor.fetch_catalog_index()
 
     def test_catalog_extraction_parses_fixture_without_browser_or_network(self):
@@ -244,9 +247,9 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         page.content.return_value = html
         page.locator.return_value.first.count.return_value = 0
         extractor._page = page
+        run_cibertec_inline(extractor)
 
-        with patch.object(extractor, "start"):
-            courses = extractor.fetch_catalog_index()
+        courses = extractor.fetch_catalog_index()
 
         self.assertEqual(len(courses), 2)
         self.assertEqual(courses[0]["curso"], "Actualización en Analítica")
@@ -267,12 +270,12 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         page.content.return_value = html
         page.wait_for_selector.side_effect = TimeoutError("fixture timeout")
         extractor._page = page
+        run_cibertec_inline(extractor)
 
-        with patch.object(extractor, "start"):
-            with self.assertRaisesRegex(
-                CibertecExtractionError, "#catalog-cursos article"
-            ):
-                extractor.fetch_catalog_index()
+        with self.assertRaisesRegex(
+            CibertecExtractionError, "#catalog-cursos article"
+        ):
+            extractor.fetch_catalog_index()
 
         self.assertEqual(extractor.raw_pages, [(extractor.base_url, html.encode("utf-8"))])
         self.assertFalse(extractor.catalog_complete)
@@ -295,9 +298,9 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         no_next_button.count.return_value = 0
         page.locator.side_effect = [next_button, no_next_button]
         extractor._page = page
+        run_cibertec_inline(extractor)
 
-        with patch.object(extractor, "start"):
-            courses = extractor.fetch_catalog_index()
+        courses = extractor.fetch_catalog_index()
 
         self.assertEqual(
             [course["curso"] for course in courses],
@@ -322,10 +325,10 @@ class CibertecFixtureBaselineTests(SimpleTestCase):
         page.locator.side_effect = [next_button]
         page.wait_for_function.side_effect = TimeoutError("pagination timeout")
         extractor._page = page
+        run_cibertec_inline(extractor)
 
-        with patch.object(extractor, "start"):
-            with self.assertRaisesRegex(CibertecExtractionError, "Timeout.*avanzar"):
-                extractor.fetch_catalog_index()
+        with self.assertRaisesRegex(CibertecExtractionError, "Timeout.*avanzar"):
+            extractor.fetch_catalog_index()
 
         self.assertFalse(extractor.catalog_complete)
 

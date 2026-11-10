@@ -1,9 +1,10 @@
+import asyncio
 from contextlib import nullcontext
 from io import StringIO
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from django.core.management import call_command
 from django.test import SimpleTestCase
@@ -30,8 +31,8 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
         runtime.chromium.launch.return_value = browser
         browser.new_context.return_value = context
         context.new_page.return_value = page
-        manager = Mock()
-        manager.start.return_value = runtime
+        manager = MagicMock()
+        manager.__enter__.return_value = runtime
         sync_api_module.sync_playwright = Mock(return_value=manager)
         playwright_module.sync_api = sync_api_module
         extractor = CibertecExtractor(timeout=3)
@@ -44,6 +45,8 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
             },
         ):
             extractor.start()
+            with self.assertRaises(RuntimeError):
+                asyncio.get_running_loop()
 
         runtime.chromium.launch.assert_called_once_with(
             headless=True, timeout=3000
@@ -53,7 +56,8 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
         page.set_default_navigation_timeout.assert_called_once_with(3000)
         extractor.close()
         browser.close.assert_called_once_with()
-        runtime.stop.assert_called_once_with()
+        manager.__enter__.assert_called_once_with()
+        manager.__exit__.assert_called_once_with(None, None, None)
 
     def test_external_id_and_canonical_url_collision_is_rejected(self):
         cursor = Mock()
@@ -131,7 +135,7 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
         engine.extractor.fetch_catalog_index.assert_not_called()
         engine.ingestion_repository.release_source_lock.assert_not_called()
 
-    def test_critical_cibertec_initialization_failure_marks_run_failed_and_releases_lock(
+    def test_critical_cibertec_failure_marks_run_failed_and_releases_lock(
         self,
     ):
         engine = ETLEngine("CIBERTEC")
@@ -142,9 +146,9 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
         engine.ingestion_repository.release_source_lock = Mock(return_value=True)
         engine._start_ingestion = Mock(return_value=(7, 8))
         engine._active_course_count = Mock(return_value=1)
-        engine.extractor.start = Mock(
+        engine.extractor.fetch_catalog_index = Mock(
             side_effect=CibertecExtractionError(
-                "Timeout (30000 ms) al iniciar Chromium para Cibertec."
+                "Timeout (5000 ms) esperando el catálogo Cibertec."
             )
         )
         engine._finish_ingestion = Mock()
@@ -165,7 +169,6 @@ class Phase4ReliabilityOfflineTests(SimpleTestCase):
             result = engine.run()
 
         self.assertEqual(result["status"], "FAILED")
-        engine.extractor.start.assert_called_once_with()
         engine._finish_ingestion.assert_called_once()
         self.assertEqual(
             engine._finish_ingestion.call_args.args[2],
